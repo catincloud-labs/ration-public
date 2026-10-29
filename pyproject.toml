@@ -1,0 +1,63 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ration"
+version = "0.1.0"
+description = "A bounded claim on a finite shared pool, granted for a period and refused rather than overdrawn."
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "David Anaya" }]
+
+# Nothing here constrains the ceiling -- there is no orchestrator dependency
+# dragging a supported-version window along with it.
+#
+# A floor is a claim, so it is CHECKED. `.github/workflows/checks.yml` carries
+# a second job, `tests (3.12)`, running this suite on the floor. Raising this
+# number means deleting that job in the same change, and lowering it further
+# means adding another, because a supported version nothing exercises is a
+# promise this repository has no evidence for. Nothing in `src/` uses a feature
+# newer than 3.12.
+requires-python = ">=3.12"
+
+# Deliberately empty. There is a working Postgres backend in `ration.postgres`
+# that passes the whole suite, and the driver it needs is a *test* dependency
+# below, not a runtime one: which store a deployment uses is decided by the
+# conformance suite's result, and a driver in this list would make the choice
+# by import instead. Passing the suite makes a store a demonstrated candidate;
+# choosing one is the deployment's decision, not this package's.
+dependencies = []
+
+[project.optional-dependencies]
+# `psycopg` is here rather than above for the reason stated in that comment. It
+# is the suite's dependency: without it the Postgres cases cannot be built, and
+# the suite falls back to this repository's own fakes -- which is why CI sets
+# RATION_REQUIRE_POSTGRES, so a run that quietly lost the only real store is red
+# instead of green.
+#
+# `duckdb` is here for the same reason and with the same status: it is a
+# CANDIDATE the suite judges, not something `ration` depends on. It differs from
+# `psycopg` in one way worth knowing -- it needs no server, so its case is
+# registered whenever the driver imports and there is no `RATION_REQUIRE_DUCKDB`
+# to write. That convenience is also the disqualification; see
+# `tests/test_duckdb_single_process.py`.
+dev = ["pytest>=8", "psycopg[binary]>=3.2", "duckdb>=1.1"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ration"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The suite imports its own support modules by package path, so the repository
+# root has to be importable. Stated here rather than left to pytest's rootdir
+# inference, which depends on where the run was started from.
+pythonpath = ["."]
+# `--strict-markers` is load-bearing, not tidiness. A conformance test declares
+# its property with a marker, and a typo in that marker would leave the test
+# undeclared -- so every violator would be required to pass it. That failure is
+# caught twice: here at collection, and by `test_the_suite_discriminates.py`.
+addopts = "-ra --strict-markers --strict-config"
+markers = [
+    "conformance(property): the contract property this test decides",
+]

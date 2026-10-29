@@ -1,0 +1,1417 @@
+#!/usr/bin/env python3
+"""Refuse a runtime-touching PR whose body does not say how it was verified.
+
+WHY THIS EXISTS. Testing in a repository happens during a PR; after the merge,
+attention moves to the next branch. Every shape below passed its PR and was
+still wrong in production. Each one happened, in a private repository of this
+estate; the issue numbers, run histories and figures stay where they were
+measured, and the shapes travel:
+
+  - a sensor iterated the wrong collection and raised on every invocation, while
+    a controls ledger row called it proven.
+  - a nightly refresh job was a no-op every OTHER night (a freshness window equal
+    to its own cron interval) and returned `200 ok` promptly having done nothing;
+    the billing showed work, then none, on alternating nights.
+  - a set of asset checks validated nothing, because a wrapper type made every
+    assertion vacuous.
+  - two dead-man switches were never wired, while looking configured, because
+    the env reader returned `""` for an absent key.
+  - a process-kill escalation had ZERO coverage while the runner and the ledger
+    both implied it was proven.
+
+The common shape is not a missing test. It is a **missing statement of what was
+observed after the change was live**, which is the one thing a PR body never has to
+contain. This makes it contain it.
+
+MOVED HERE FROM the first repository it gated, into a shared action, which
+settled the half of the question that asked where the checker lives; whether it
+BINDS a repository, and with which fields, was ruled 2026-08-28 (per-repo
+fields): `Dev:` is required in every enforced repository;
+`Prod:`/`Discriminator:` are required only where a box exists to observe
+(`require-prod`), because a field that is structurally always N/A trains the
+reflex of writing N/A -- in a repository with no box, a required `Prod:` can
+only ever be answered N/A, so every failure it produces is the same failure and
+none of them is the one this check exists for. Where Prod is not required it
+is still never ignored: a `Prod:` line
+that IS present is validated exactly as in full mode, because a present claim
+is a claim.
+
+WHAT IT ASSERTS. If the PR changes a runtime path, its body must carry a
+`## Verification` section with:
+
+    ## Verification
+
+    **Dev:** what was run, and the result.
+    **Prod:** what was observed on the box  --  OR  --  `N/A - <reason>`
+    **Discriminator:** what reads DIFFERENTLY before and after.
+
+`Prod: N/A` is allowed and always will be: plenty of changes are not wire-visible,
+and some need a billed query nobody should run to satisfy a linter. **But it must
+carry a reason.** The failure being fixed is silence, and a written reason is
+auditable where an absence is not. That is the whole of the escape hatch, and it is
+deliberately one line wide.
+
+`Discriminator:` is required only when Prod is not N/A, and it is the field that
+separates verification from the no-op nightly job above. *"the endpoint returned
+200"* is not a
+discriminator, because it returned 200 before the change too. **A discriminator is
+a thing whose value differs between the old build and the new one** -- an image
+digest, a log line's changed wording, a field that appears or disappears, a number
+that moves. Prose cannot be checked for that, so this script only checks the field
+is present and substantive; the reader does the rest.
+
+WHAT IT DELIBERATELY DOES NOT DO. It does not grade the evidence, and it holds no
+list of acceptable phrasings. A checker that scored wording would be gamed into
+hollow compliance, which is worse than the silence it replaced: it would make an
+unverified change *look* verified, which is the exact failure mode of every incident
+listed above.
+
+WHICH PATHS IT GATES, AND WHY THAT IS NOW THE DEFAULT. A changed path is runtime
+unless `NOT_RUNTIME` says why it is not. It used to be the reverse -- four declared
+prefixes were gated and everything else was exempt by saying nothing -- which meant
+a new runtime directory exempted itself on arrival, with no diff recording it.
+
+It still does NOT gate `scripts/` or `.github/`, and that remains a decision rather
+than an oversight. A CI checker cannot be observed on the box, so its `Prod:` line
+would be `N/A` every single time -- and a field that is structurally always N/A
+teaches the reflex of writing N/A, which is precisely the habit this gate exists to
+break. The control appropriate to a checker is a **self-test that is proven to go
+red**, and the action that invokes this checker runs its self-test ahead of
+it. What changed is that the reason is now written next to the exemption and
+printed when it applies, instead of being inferred from a name's absence.
+
+That paragraph was also WRONG about two files, and only about them. Two
+`scripts/` files that production ran (one the entrypoint of a running compose
+service, one copied into a service image) were exempt for as long as this gate
+had existed, and were then named in `SHIPPED_ANYWAY` and gated. Both later LEFT
+the tree that first ran this check, when their service moved to a repository of
+its own -- so `SHIPPED_ANYWAY` is EMPTY now, kept as the mechanism (with its
+self-test) for the next file that ships from `scripts/` despite the directory's
+exemption; a file only one adopter ships arrives through the `shipped-anyway`
+input instead.
+
+NOTHING SCANNED IS NOT ALL CLEAR. If the changed-file list is absent or empty, this
+exits 1 saying it could not check. Every checker in this estate carries the same
+rule for the same reason: exit 0 has to mean "checked and clean", never "found nothing to do".
+
+    python3 scripts/check_verification_section.py --self-test
+    python3 scripts/check_verification_section.py pr.txt --changed-files files.txt
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import io
+import os
+import re
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections.abc import Callable
+from pathlib import Path
+
+#: A CHANGED PATH IS RUNTIME UNLESS SOMETHING BELOW SAYS WHY IT IS NOT.
+#:
+#: This used to be the other way round: a tuple named RUNTIME_PREFIXES held four
+#: directories, and everything outside it was exempt by saying nothing. That list
+#: was the SCOPE OF ENFORCEMENT, so a new runtime directory exempted itself on
+#: arrival and no diff recorded the decision -- the shape ADR-0025 (2026-08-19)
+#: refuses. Read against the first adopter's tree, paths that alter what runs
+#: on the box read as not-runtime, among them the `build:` contexts of running
+#: compose services and a `scripts/` file compose executed as an ENTRYPOINT;
+#: the self-test's polarity list below is the reproducible form of that reading.
+#:
+#: The declared list is now the EXEMPTION, which is the half ADR-0025 says must be
+#: minimal and must carry its reason. A reason is data here rather than a comment
+#: beside the rule, because the run prints it: an exemption nobody can see applied
+#: is indistinguishable from a gate that did not fire.
+#:
+#: NOT the derived half of ADR-0025, and the falsifier there does not apply. That
+#: falsifier -- "an exclusion list longer than the enumeration it replaced" -- is
+#: about a DERIVED population whose hand-written list merely moved. Deriving here
+#: would mean classifying every top-level entry so a new one goes red, i.e.
+#: trading a short exemption list for a long enumeration, which is the thing
+#: the falsifier
+#: names. Refusal by default is the other authorised shape, and it is this one.
+NOT_RUNTIME: tuple[tuple[str, str], ...] = (
+    (
+        r"(^|/)tests?/.*\.py$",
+        "a Python test under a test directory is run by CI before shipping and "
+        "by nothing after; it ships in both image-building adopters, harmlessly. "
+        "Anything else under a test directory is runtime by default: a dbt "
+        "singular test ships and runs on a schedule after merge (narrowed 2026-09-16)",
+    ),
+    # This entry used to read `(^|/)tests?/` with the reason "a test does not
+    # ship; it is what runs before shipping". Both halves were false in the
+    # two image-building adopters (`COPY . .` ships every test path), and the
+    # pattern exempted a dbt singular test under an `analytics/tests/`
+    # directory, one a scheduled asset runs after every merge, so a pull
+    # request weakening it merged with no `## Verification` section.
+    # Narrowed 2026-09-16 (ruled 2026-09-15). The rejected shapes, a
+    # dbt-project carve-out and a prefix form of `shipped-anyway`, are both
+    # registries, and this estate has measured that a gate's scope list fails
+    # open when the second entry arrives. The cost: a fixture-only change
+    # under `tests/` now owes one honest paragraph.
+    (r"\.md$", "prose cannot alter what the box does"),
+    (
+        r"^\.github/",
+        "CI. A checker cannot be observed on the box, so its `Prod:` line is "
+        "structurally N/A -- see WHAT IT DELIBERATELY DOES NOT DO above",
+    ),
+    (r"^\.githooks/", "a hook runs on a workstation, never on the box"),
+    (
+        r"^scripts/",
+        "same reason as `.github/`: this directory is CI checkers -- any path "
+        "here that ships despite that goes in SHIPPED_ANYWAY below (empty "
+        "since its two entries left with the service that shipped them)",
+    ),
+    (r"^LICENSE$", "not executed by anything"),
+    (r"^\.gitignore$|^\.gitattributes$", "VCS metadata; git does not run on the box"),
+    (
+        r"^renovate\.json$",
+        "configures a bot that opens pull requests, and every change it proposes "
+        "arrives as a PR gated by this very check",
+    ),
+    (
+        r"^\.trivyignore$",
+        "decides what CI refuses to ship, not what a shipped image does once it "
+        "is running",
+    ),
+    (
+        r"^\.env\.example$",
+        "a template. The box reads its own env file; this file is compared "
+        "against it by a key-drift check and is never copied onto the host",
+    ),
+)
+
+#: EXCEPTIONS TO AN EXEMPTION, and they are the reason `scripts/` above is a
+#: blanket rather than a truth. The first adopter's service Dockerfile said in
+#: as many words that it deliberately did not copy `scripts/` because most of
+#: that directory is CI -- and then copied exactly two files from it. So the
+#: docstring's claim that this checker does not gate `scripts/` was right about
+#: the directory and wrong about the two files in it that production ran.
+#:
+#: Those two left with their service when it moved to a repository of its own
+#: (ADR-0026, 2026-08-19), and the self-test asserts every entry here is still
+#: in the tree -- so this carve-out goes red rather than quietly becoming a
+#: claim about files that no longer exist.
+SHIPPED_ANYWAY: tuple[tuple[str, str], ...] = (
+    # EMPTY since the two entries this held left with the service that shipped
+    # them; the copies that ship are gated by that service's own repository,
+    # which declares them through the `shipped-anyway` input. The mechanism
+    # stays: a `scripts/` file that starts shipping again is named here with
+    # its reason; the self-test asserts every entry carves a real hole, and
+    # the check step asserts it still names a file at the head commit,
+    # through the API, beside the input channel's entries (ruled 2026-09-15).
+)
+
+_NOT_RUNTIME_RES: tuple[tuple[re.Pattern[str], str], ...] = tuple(
+    (re.compile(p), why) for p, why in NOT_RUNTIME
+)
+
+_HEADING_RE = re.compile(r"^\s{0,3}(#{2,6})\s*verification\b", re.IGNORECASE)
+_NEXT_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+\S")
+
+#: `**Dev:**`, `Dev:`, `- **Prod**:` ... permissive on decoration, strict on the label.
+def _label_re(label: str) -> re.Pattern[str]:
+    return re.compile(
+        rf"^\s*(?:[-*+]\s*)?\**\s*{label}\s*\**\s*:\s*\**\s*(?P<value>.*)$",
+        re.IGNORECASE,
+    )
+
+
+_DEV_RE = _label_re("dev")
+_PROD_RE = _label_re("prod")
+_DISCRIMINATOR_RE = _label_re("discriminator")
+
+#: `N/A`, `n/a`, `NA`, `none`, optionally followed by the reason.
+#: The dash class is spelled in escapes (em dash, hyphen, en dash) so that this
+#: file stays ASCII where it is vendored into a public tree; `re` reads `\uXXXX`.
+_NA_RE = re.compile(r"^\s*(?:n/?a|none|not applicable)\b[\s:\u2014\-\u2013]*(?P<reason>.*)$", re.IGNORECASE)
+
+#: Enough alphanumerics to be a sentence rather than a shrug. Deliberately low: the
+#: point is to force a statement, not to police prose length.
+_MIN_CONTENT = 15
+_MIN_REASON = 20
+
+
+def _substance(text: str) -> int:
+    """Alphanumeric characters, so `-`, `n/a`, `...` and `TODO:` do not qualify."""
+
+    return len(re.sub(r"[^0-9A-Za-z]", "", text))
+
+
+def _normalise(path: str) -> str:
+    """A repo-relative POSIX path.
+
+    The leading `./` is stripped ONE segment at a time and only when it is
+    exactly that. This used to be `.lstrip("./")`, which strips any run of `.`
+    and `/` characters and therefore ate the leading dot off every dotfile:
+    `.github/workflows/ci.yml` normalised to `github/workflows/ci.yml`.
+
+    That was harmless while no pattern here began with a dot, and it stopped
+    being harmless in this change -- `^\\.github/` and three of its neighbours in
+    NOT_RUNTIME would never have matched, so the exemptions would have silently
+    failed to apply. It fails toward gating rather than toward silence, which is
+    the safe direction and still the wrong answer.
+    """
+
+    path = path.strip().replace("\\", "/")
+    while path.startswith("./"):
+        path = path[2:]
+    return path
+
+
+def exemption_for(
+    path: str, extra_shipped: tuple[tuple[str, str], ...] = ()
+) -> str | None:
+    """Why this path is not runtime, or None when it is.
+
+    Order is the control: a SHIPPED_ANYWAY path is runtime even though a
+    NOT_RUNTIME pattern covers it, so it has to be asked first.
+
+    ``extra_shipped`` is the per-repository half of that list, arriving from the
+    action's ``shipped-anyway`` input (ruled 2026-08-28): the built-in list
+    describes what every adopter shares, and a file only one repository ships --
+    the compose entrypoint the built-in list's own history warned about -- is
+    that repository's to declare, not this file's to hardcode.
+    """
+
+    path = _normalise(path)
+    if not path:
+        return "empty path"
+    for shipped, _why in tuple(SHIPPED_ANYWAY) + tuple(extra_shipped):
+        if path == shipped:
+            return None
+    for pattern, why in _NOT_RUNTIME_RES:
+        if pattern.search(path):
+            return why
+    return None
+
+
+def is_runtime_path(
+    path: str, extra_shipped: tuple[tuple[str, str], ...] = ()
+) -> bool:
+    return _normalise(path) != "" and exemption_for(path, extra_shipped) is None
+
+
+def runtime_paths(
+    paths: list[str], extra_shipped: tuple[tuple[str, str], ...] = ()
+) -> list[str]:
+    return [p.strip() for p in paths if is_runtime_path(p, extra_shipped)]
+
+
+def parse_shipped_anyway(entries: list[str]) -> tuple[tuple[str, str], ...]:
+    """Validate caller-supplied carve-outs, refusing the two registry defects.
+
+    Each entry is ``path -- reason``. The same discipline the self-test applies
+    to the built-in list applies here, at parse time and fail-closed: a
+    carve-out must carve a real hole (some NOT_RUNTIME pattern must cover the
+    path, or the entry asserts a hole that does not exist), and it must carry a
+    reason with substance (a name nobody dares delete is how registries rot).
+    Tree existence cannot be asserted at parse time -- the caller runs without
+    a checkout, deliberately -- so that half runs in the check step, through the
+    API at the pull request's head commit (`_check_live_carve_outs`, ruled 2026-09-15).
+    This docstring used to say that half "lives in the adopting repository,
+    whose own docs name the shipping files"; a register nothing reads is the
+    shape this checker exists to refuse, and that is why it moved.
+
+    Raises ``SystemExit(1)`` with the defect named, because a misdeclared
+    carve-out silently un-carving itself is exactly the fail-open registry
+    shape this checker exists to refuse.
+    """
+
+    parsed: list[tuple[str, str]] = []
+    for raw in entries:
+        head, sep, reason = raw.partition(" -- ")
+        path = _normalise(head.strip())
+        if not sep or not path or _substance(reason) < _MIN_REASON:
+            print(
+                f"could NOT check: shipped-anyway entry {raw!r} is not "
+                "'path -- reason' with a reason of substance. A carve-out "
+                "without a reviewable reason is a name somebody will not dare "
+                "delete.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+        if not any(p.search(path) for p, _ in _NOT_RUNTIME_RES):
+            print(
+                f"could NOT check: shipped-anyway entry {path!r} is covered by "
+                "no exemption, so naming it asserts a hole that does not "
+                "exist -- it is already runtime and the entry is dead weight.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+        parsed.append((path, reason.strip()))
+    return tuple(parsed)
+
+
+#: Where a carve-out's file is looked for, and what came back (ruled
+#: 2026-09-15). `present` and `absent` are answers. `blind` is the store not
+#: answering -- a 403, a 5xx, a timeout, no network -- and it is reported as its
+#: own failure, never as absent and never as a pass: a flaky API must be able
+#: to turn this check neither red for the wrong reason nor green.
+Verdict = tuple[str, str]
+Resolver = Callable[[str], Verdict]
+
+
+def tree_resolver(root: Path) -> Resolver:
+    """Existence in a directory: the self-test's STAGED root, never the caller's CWD."""
+
+    def resolve(path: str) -> Verdict:
+        if (root / path).is_file():
+            return ("present", "file")
+        return ("absent", "no such file")
+
+    return resolve
+
+
+def _api_get(url: str, token: str, timeout: float) -> Verdict:
+    """One authenticated GET: ("present", status), ("absent", "HTTP 404") or ("blind", why)."""
+
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "verification-section-checker",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return ("present", f"HTTP {resp.status}")
+    except urllib.error.HTTPError as err:
+        if err.code == 404:
+            return ("absent", "HTTP 404")
+        return ("blind", f"HTTP {err.code}")
+    except (urllib.error.URLError, TimeoutError, OSError) as err:
+        return ("blind", f"{type(err).__name__}: {err}")
+
+
+def head_commit_visible(repo: str, ref: str, token: str, timeout: float = 10.0) -> Verdict:
+    """Whether the token can see `ref` in `repo` at all -- read BEFORE any path is judged absent.
+
+    The contents API answers 404 for three different things: a path that is
+    not in the tree, a ref that does not resolve, and a repository the token
+    cannot see (measured 2026-09-16: `contents/README.md?ref=<40 zeros>` and
+    `contents/README.md` on a repository that does not exist both answer 404,
+    exactly like `contents/no_such_file.py` at a real commit). Only the first
+    is a dead entry; the other two are blindness wearing its status code. The
+    commits endpoint separates them -- 200 for a commit the token can read,
+    422 for a sha the repository does not hold, 404 for a repository it cannot
+    see -- so one read here decides whether a 404 on a path may be believed.
+    """
+
+    return _api_get(
+        f"https://api.github.com/repos/{repo}/commits/{urllib.parse.quote(ref)}", token, timeout
+    )
+
+
+def api_resolver(repo: str, ref: str, token: str, timeout: float = 10.0) -> Resolver:
+    """Existence at the pull request's head commit, through the contents API.
+
+    One GET per carve-out with the token the action already holds (the callers
+    grant `contents: read` beside `pull-requests: read`). The four required
+    callers run without a checkout, deliberately, so the tree a carve-out must
+    exist in is asked for by commit rather than looked for on disk. A 404 here
+    is "absent" only once `head_commit_visible` has answered 200 for the same
+    repo and ref; the caller reads that first.
+    """
+
+    def resolve(path: str) -> Verdict:
+        return _api_get(
+            f"https://api.github.com/repos/{repo}/contents/"
+            f"{urllib.parse.quote(path)}?ref={urllib.parse.quote(ref)}",
+            token,
+            timeout,
+        )
+
+    return resolve
+
+
+def carve_out_problems(
+    entries: tuple[tuple[str, str], ...], resolve: Resolver
+) -> tuple[list[str], list[str]]:
+    """Both dead-entry arms over ONE list: (dead entries, blind reads).
+
+    Arm one, nothing exempts it: the entry asserts a hole that does not exist.
+    Arm two, not in the tree: the entry outlived the file it names. Both run
+    over the built-in tuple and the input channel together, because the input
+    channel held the only live carve-outs in the estate and neither arm
+    reached them (ruled 2026-09-15: `_check_carve_outs` walked `SHIPPED_ANYWAY` alone
+    while `exemption_for` honoured both). A blind read is neither dead nor
+    alive and comes back apart, so the caller can refuse to judge it.
+    """
+
+    dead: list[str] = []
+    blind: list[str] = []
+    for shipped, _why in entries:
+        if not any(p.search(shipped) for p, _ in _NOT_RUNTIME_RES):
+            dead.append(
+                f"{shipped}: nothing exempts it, so naming it asserts a hole "
+                "that does not exist"
+            )
+        state, detail = resolve(shipped)
+        if state == "absent":
+            dead.append(
+                f"{shipped}: not in the tree at the head commit ({detail}). It "
+                "has moved or been deleted -- remove the entry in the same "
+                "change, or this is a claim about nothing"
+            )
+        elif state == "blind":
+            blind.append(
+                f"{shipped}: existence could NOT be read ({detail}); not read "
+                "as absent and not read as present"
+            )
+    return dead, blind
+
+
+def _check_live_carve_outs(
+    entries: tuple[tuple[str, str], ...], head_sha: str | None
+) -> int:
+    """The dead-entry arms at check time, at the head commit, through the API."""
+
+    repo = os.environ.get("GH_REPO", "")
+    token = os.environ.get("GH_TOKEN", "")
+    if not (head_sha and repo and token):
+        print(
+            "could NOT check: carve-outs are declared, and asserting that each "
+            "still names a file at the head commit needs --head-sha, GH_REPO and "
+            "GH_TOKEN. Exiting 1 rather than 0: an unchecked carve-out is a hole "
+            "nobody has looked at.",
+            file=sys.stderr,
+        )
+        return 1
+    state, detail = head_commit_visible(repo, head_sha, token)
+    if state != "present":
+        print(
+            f"could NOT check: the head commit {head_sha[:7]} could not be read in "
+            f"{repo} ({detail}), so no carve-out's absence can be believed -- a 404 "
+            "on a path at an unreadable ref is not a dead entry. Not read as absent "
+            "and not read as present.",
+            file=sys.stderr,
+        )
+        return 1
+    dead, blind = carve_out_problems(entries, api_resolver(repo, head_sha, token))
+    for line in blind:
+        print(f"could NOT check: carve-out {line}", file=sys.stderr)
+    for line in dead:
+        print(f"dead carve-out: {line}", file=sys.stderr)
+    if dead or blind:
+        return 1
+    noun = "entry" if len(entries) == 1 else "entries"
+    print(
+        f"carve-outs: {len(entries)} {noun}, each covered by an exemption and "
+        f"present at {head_sha[:7]}"
+    )
+    return 0
+
+
+#: A fence opener, and the two things that can start on an ordinary line: an
+#: inline code span (skipped whole, so a body that MENTIONS the comment marker
+#: in backticks is not read as opening one) or a comment. A backtick fence's
+#: opening line holds no later backtick: without that, a line that merely
+#: STARTS with a code span of three ticks was read as a fence that never
+#: closed, and every comment below it was kept (found in review, 2026-09-21).
+_FENCE_RE = re.compile(r"^ {0,3}(?P<fence>`{3,}(?!.*`)|~{3,})")
+_SPAN_OR_COMMENT_RE = re.compile(r"(?P<ticks>`+).*?(?P=ticks)|(?P<open><!--)")
+
+
+def _uncomment_line(line: str, closes_in_paragraph: bool) -> tuple[str, bool]:
+    """One line outside any fence, with its comments removed, and whether it
+    leaves a comment open.
+
+    An opener its own line does not close is one of two things. Where nothing
+    but a removed comment precedes it, it is an HTML block: hidden up to the next
+    closer wherever that is, or to the end of the document. Mid-line it is
+    inline, and an inline comment cannot cross a blank line: with no closer
+    before the paragraph ends it renders as the literal characters and is
+    kept as them. Every real template ends in a comment, so "a closer
+    anywhere later" is true of every body and cannot be the test.
+
+    The closer is looked for two characters into the opener, because `<!-->`
+    and `<!--->` are whole comments.
+    """
+
+    kept: list[str] = []
+    pos = 0
+    while True:
+        m = _SPAN_OR_COMMENT_RE.search(line, pos)
+        while m and not m.group("open"):
+            m = _SPAN_OR_COMMENT_RE.search(line, m.end())
+        if not m:
+            return "".join(kept) + line[pos:], False
+        kept.append(line[pos : m.start()])
+        end = line.find("-->", m.start() + 2)
+        if end >= 0:
+            pos = end + 3
+            continue
+        if closes_in_paragraph or not "".join(kept).strip():
+            return "".join(kept), True
+        return "".join(kept) + line[m.start() :], False
+
+
+def _closes_in_paragraph(lines: list[str], i: int) -> bool:
+    """Whether a closer stands on a line after `i` and before the next blank one."""
+
+    for later in lines[i + 1 :]:
+        if not later.strip():
+            return False
+        if "-->" in later:
+            return True
+    return False
+
+
+def strip_comments(body: str) -> str:
+    """The body as a reader of the rendered page sees it: HTML comments removed.
+
+    WHY. The estate's PR templates carry their instructions in comments, and an
+    instruction that starts a line with a label and a colon was read as that
+    label's VALUE, ahead of the bare label the author is meant to fill -- so a
+    template submitted unedited passed (measured 2026-09-19 on one adopter's
+    template, open since 2026-08-16). The self-test could not see it: its
+    unedited-template fixture had no comment block, which no real template
+    lacks. A comment is invisible on the rendered pull request, so nothing in
+    it is a statement anybody made; it is removed before the heading is
+    looked for, because a heading inside a comment is no more real than a
+    label there.
+
+    Whichever opens first wins: a marker inside a fence is pasted output and
+    stays, a fence inside a comment is hidden with it. Each removed line
+    leaves an empty one, so nothing is joined that was apart.
+
+    KNOWN LIMITS. This reads lines, not a document tree, so it follows the
+    rendered page only for structure that starts a line within three spaces.
+    A fence indented under a list item or quoted with `>`, an indented code
+    block, and a code span that runs across a line break are not seen as
+    code, so a bare comment opener inside one is read as an opener. Each
+    fails closed, and only on a body that both carries the marker as
+    evidence and has a closer later in that paragraph or block; backticks
+    on the same line as the marker are the way out. In the other direction,
+    removing a commented-out heading lets the section run on to the next
+    real heading, which is what the rendered page shows too.
+    """
+
+    lines = body.splitlines()
+    out: list[str] = []
+    fence = ""
+    in_comment = False
+    for i, line in enumerate(lines):
+        if in_comment:
+            end = line.find("-->")
+            if end < 0:
+                out.append("")
+                continue
+            line, in_comment = line[end + 3 :], False
+        elif fence:
+            out.append(line)
+            if line.strip().startswith(fence) and not line.strip().strip(fence[0]):
+                fence = ""
+            continue
+        elif m := _FENCE_RE.match(line):
+            fence = m.group("fence")
+            out.append(line)
+            continue
+        kept, in_comment = _uncomment_line(line, _closes_in_paragraph(lines, i))
+        out.append(kept)
+    return "\n".join(out)
+
+
+def extract_section(body: str) -> str | None:
+    """The `## Verification` section's text, or None when there is no such heading.
+
+    Reads what it is given: `check` hands it a body with its comments removed.
+    """
+
+    lines = body.splitlines()
+    start = None
+    for i, line in enumerate(lines):
+        if _HEADING_RE.match(line):
+            start = i + 1
+            break
+    if start is None:
+        return None
+    out: list[str] = []
+    for line in lines[start:]:
+        if _NEXT_HEADING_RE.match(line):
+            break
+        out.append(line)
+    return "\n".join(out)
+
+
+def _field(section: str, pattern: re.Pattern[str]) -> str | None:
+    """The field's value: the label line's own remainder -- or, when the label
+    stands alone on its line, the lines that follow it, up to the next label
+    or heading.
+
+    The follow-on half exists because the estate's PR templates preprint the
+    bare label (``**Dev:**``) and instruct pasting verbatim output BELOW it.
+    Reading the label line alone scored exactly that shape as missing -- a
+    false red on a body full of evidence, observed live on an adopter's
+    first template-shaped body (2026-08-28). The template-side
+    fixes both fail: a same-line placeholder substantial enough to satisfy
+    the gate lets an UNEDITED template pass (fail-open), and instructing
+    authors to keep the value on the label line trains one-line prose
+    summaries instead of verbatim output -- the hollow compliance this
+    module's docstring warns against.
+
+    A line inside pasted output that itself looks like a heading or label
+    stops the collection early; the value gathered up to that point still
+    counts, so real evidence keeps passing and an empty section still fails.
+    """
+
+    lines = section.splitlines()
+    for i, line in enumerate(lines):
+        m = pattern.match(line)
+        if not m:
+            continue
+        value = m.group("value").strip()
+        if value:
+            return value
+        following: list[str] = []
+        for after in lines[i + 1 :]:
+            if _NEXT_HEADING_RE.match(after) or any(
+                label.match(after)
+                for label in (_DEV_RE, _PROD_RE, _DISCRIMINATOR_RE)
+            ):
+                break
+            following.append(after)
+        return "\n".join(following).strip()
+    return None
+
+
+def check(
+    body: str,
+    changed: list[str],
+    require_prod: bool = True,
+    extra_shipped: tuple[tuple[str, str], ...] = (),
+) -> list[str]:
+    """Every problem found. Empty means clean.
+
+    `require_prod=False` is the library-repo mode (ruled 2026-08-28): `Prod:` and
+    `Discriminator:` stop being REQUIRED, and everything present is still
+    validated -- a bare `Prod: N/A` or thin evidence fails in both modes.
+    """
+
+    problems: list[str] = []
+    touched = runtime_paths(changed, extra_shipped)
+    if not touched:
+        return problems
+
+    section = extract_section(strip_comments(body))
+    if section is None:
+        fields = (
+            "Dev / Prod / Discriminator lines; `Prod: N/A - <reason>` is a "
+            "valid answer, silence is not."
+            if require_prod
+            else "a Dev line saying what was run and what it reported."
+        )
+        return [
+            "no `## Verification` section, and this PR changes runtime paths "
+            f"({', '.join(touched[:4])}{'...' if len(touched) > 4 else ''}). "
+            f"Add {fields}"
+        ]
+
+    dev = _field(section, _DEV_RE)
+    prod = _field(section, _PROD_RE)
+    disc = _field(section, _DISCRIMINATOR_RE)
+
+    if dev is None or _substance(dev) < _MIN_CONTENT:
+        problems.append(
+            "`Dev:` is missing or too thin. Say what was run and what it reported."
+        )
+
+    if prod is None:
+        if require_prod:
+            problems.append(
+                "`Prod:` is missing. It is the line this check exists for: every "
+                "incident in this script's docstring passed its PR and failed on "
+                "the box."
+            )
+        # Not required here: absent is a complete answer, and `Discriminator:`
+        # without a Prod claim has nothing to discriminate.
+        return problems
+
+    na = _NA_RE.match(prod)
+    if na:
+        reason = na.group("reason")
+        if _substance(reason) < _MIN_REASON:
+            problems.append(
+                "`Prod: N/A` needs a reason on the same line. 'N/A' alone is the "
+                "silence this check replaces -- write why the change is not "
+                "observable on the box, or what would have to be true to observe it."
+            )
+        return problems
+
+    if _substance(prod) < _MIN_CONTENT:
+        problems.append("`Prod:` is too thin to be evidence. Name what was observed.")
+
+    if disc is None or _substance(disc) < _MIN_CONTENT:
+        problems.append(
+            "`Discriminator:` is missing or too thin, and `Prod:` claims real "
+            "evidence. Name the thing that reads DIFFERENTLY before and after -- an "
+            "image digest, a changed log wording, a field that appears or "
+            "disappears, a number that moves. '200 OK' is not a discriminator: it "
+            "was 200 before the change too (the no-op nightly job in this file's "
+            "docstring returned 200 every night while doing nothing)."
+        )
+    return problems
+
+
+# --------------------------------------------------------------------------- #
+# Self-test. Runs FIRST in CI, because a checker that has silently stopped
+# matching is indistinguishable from a clean PR -- which is the class of bug this
+# whole script is about.
+# --------------------------------------------------------------------------- #
+
+# Fixtures are invented: plausible shapes of real evidence, carrying no
+# measurement from any repository, so they can travel wherever this file does.
+_RUNTIME = ["app/services/responder.py"]
+_DOCS = ["app/CONTRACT.md", "README.md"]
+_TESTS = ["app/tests/test_responder.py"]
+
+_GOOD = """## Verification
+
+**Dev:** full suite, example passed / example skipped against the pinned engine.
+**Prod:** `GET /example` 200 on the deployed image; the ledger table untouched.
+**Discriminator:** `example_flag_enabled` logs the new wording, absent from the old image.
+"""
+
+_NA_WITH_REASON = """## Verification
+
+**Dev:** new tests added for the path; the whole suite passed.
+**Prod:** N/A - nothing is wired yet, so no route reaches this code and there is no wire-visible change to observe.
+"""
+
+#: The shape every estate PR template propagates: the bare label on its own
+#: line, verbatim output pasted below it. Scored as missing until 2026-08-28.
+_TEMPLATE_SHAPED = """## Verification
+
+**Dev:**
+
+```
+> pytest -q
+example passed, 0 failed
+```
+
+**Prod:** `GET /example` 200 on the deployed image; the ledger table untouched.
+**Discriminator:** `example_flag_enabled` logs the new wording, absent from the old image.
+"""
+
+#: The same shape with nothing pasted -- an unedited template must still fail,
+#: which is why the fix lives here and not in a template placeholder.
+_UNEDITED_TEMPLATE = """## Verification
+
+**Dev:**
+
+## Issue references
+
+Part of #
+"""
+
+#: The shape templates actually have, which the fixture above never had: the
+#: instructions sit in a comment, and they start their lines with the labels.
+#: Until 2026-09-21 each instruction was read as its label's value and this
+#: body, submitted untouched, passed in both prod modes. The comment ahead of
+#: the section carries a heading and a full set of labels for the same reason:
+#: a section opened inside a comment is one nobody wrote.
+_COMMENTED_TEMPLATE = """<!--
+Fill every section. An example of a finished one:
+
+## Verification
+
+Dev: the whole suite was run and every example in it passed.
+Prod: N/A - an example reason long enough to be read as a real one.
+-->
+
+## What changed
+
+<!-- One paragraph, in terms of observable behaviour after the merge. -->
+
+## Verification
+
+<!--
+Dev: verbatim output, not a description of output: the command and what it
+reported, pasted below the label.
+
+Prod: what you observed after it deployed. `N/A - <reason>` is always a valid
+answer, and silence never is.
+
+Discriminator: the thing that reads DIFFERENTLY before and after, required
+whenever the line above is not N/A.
+
+```
+an example fence inside the comment, hidden with it
+```
+-->
+
+**Dev:**
+
+**Prod:**
+
+**Discriminator:**
+
+## Issue references
+
+<!-- Part of, or refs. -->
+"""
+
+#: The same template filled in, comments left where they were, which is what
+#: an author actually submits. The evidence quotes both comment markers, in a
+#: fence and in backticks, unclosed: pasted output is not markup.
+_COMMENTED_TEMPLATE_FILLED = _COMMENTED_TEMPLATE.replace(
+    "**Dev:**\n",
+    "**Dev:**\n\n```\n> grep -c '<!--' example.md\n3\n```\n",
+).replace(
+    "**Prod:**\n",
+    "**Prod:** the deployed page no longer renders a stray `<!--` above the fold.\n",
+).replace(
+    "**Discriminator:**\n",
+    "**Discriminator:** the page source carried the marker twice before, once after.\n",
+)
+
+#: Every red body below is complete apart from its comment, so that reading
+#: the comment is the only way to pass it: each case is red in both prod modes
+#: for that one reason, not for a missing `Prod:` that full mode refuses anyway.
+_EXAMPLE_NA = "**Prod:** N/A - an example reason long enough to be read as a real one.\n"
+
+_COMMENT_CASES: list[tuple[str, str, list[str], bool]] = [
+    ("unedited template, labelled instructions in a comment", _COMMENTED_TEMPLATE, _RUNTIME, False),
+    ("the same template filled in, comments kept", _COMMENTED_TEMPLATE_FILLED, _RUNTIME, True),
+    (
+        "a placeholder comment on the label line is not a value",
+        "## Verification\n\n**Dev:** <!-- the command and what it reported, verbatim -->\n"
+        + _EXAMPLE_NA,
+        _RUNTIME,
+        False,
+    ),
+    (
+        "a section that exists only inside a comment",
+        "<!--\n## Verification\n\n**Dev:** the whole suite was run and all of it passed.\n"
+        + _EXAMPLE_NA
+        + "-->\n",
+        _RUNTIME,
+        False,
+    ),
+    (
+        # The evidence stands AFTER the marker and the body ends in a comment,
+        # as every real body does: read as an opener, the marker would take
+        # the evidence in both prod modes. The first draft of this case had
+        # its evidence before the marker and no later closer, and pinned
+        # nothing in one mode and the wrong rule in the other.
+        "an unclosed marker mid-line is text, though the template's last comment closes later",
+        "## Verification\n\n**Dev:** <!-- was left in the page; removed, and the whole suite passed.\n"
+        + _EXAMPLE_NA
+        + "\n## Issue references\n\n<!-- Part of, or refs. -->\n",
+        _RUNTIME,
+        True,
+    ),
+    (
+        "a comment opened mid-line and closed in the same paragraph is one comment",
+        "## Verification\n\n**Dev:** <!-- the command and what it\nreported, verbatim, pasted here -->\n"
+        + _EXAMPLE_NA,
+        _RUNTIME,
+        False,
+    ),
+    (
+        "evidence after a comment on the label line is the value",
+        "## Verification\n\n**Dev:** <!-- paste --> ran the whole suite, example passed.\n" + _EXAMPLE_NA,
+        _RUNTIME,
+        True,
+    ),
+    (
+        "evidence after a multi-line comment's closer is kept",
+        "## Verification\n\n**Dev:**\n<!-- the command and\nwhat it reported --> ran the whole suite, example passed.\n"
+        + _EXAMPLE_NA,
+        _RUNTIME,
+        True,
+    ),
+    (
+        "a closed fence above the template does not shelter its comments",
+        "```text\nexample output\n```\n\n" + _COMMENTED_TEMPLATE,
+        _RUNTIME,
+        False,
+    ),
+    (
+        "nor does a closed tilde fence",
+        "~~~\nexample output\n~~~\n\n" + _COMMENTED_TEMPLATE,
+        _RUNTIME,
+        False,
+    ),
+    (
+        "a line that starts with a three-tick code span opens no fence",
+        "```make lint``` now runs first.\n\n" + _COMMENTED_TEMPLATE,
+        _RUNTIME,
+        False,
+    ),
+    (
+        "the four- and five-character comments are whole comments",
+        "## Verification\n\n<!-->\n**Dev:** ran the whole suite, example passed.\n<!--->\n" + _EXAMPLE_NA,
+        _RUNTIME,
+        True,
+    ),
+    (
+        "an unclosed marker at line start hides the rest, as rendered",
+        "## Verification\n\n<!-- instructions nobody closed\n"
+        "**Dev:** ran the whole suite, example passed.\n"
+        + _EXAMPLE_NA,
+        _RUNTIME,
+        False,
+    ),
+]
+
+_CASES: list[tuple[str, str, list[str], bool]] = [
+    ("complete", _GOOD, _RUNTIME, True),
+    ("n/a with a reason", _NA_WITH_REASON, _RUNTIME, True),
+    ("template-shaped: evidence below the bare label", _TEMPLATE_SHAPED, _RUNTIME, True),
+    ("unedited template is still refused", _UNEDITED_TEMPLATE, _RUNTIME, False),
+    ("docs-only change is not gated", "no section at all", _DOCS, True),
+    ("test-only change is not gated", "no section at all", _TESTS, True),
+    ("no section", "Some body text.", _RUNTIME, False),
+    (
+        "no Prod line",
+        "## Verification\n\n**Dev:** ran the whole suite, example passed.\n",
+        _RUNTIME,
+        False,
+    ),
+    (
+        "bare N/A",
+        "## Verification\n\n**Dev:** ran the whole suite, example passed.\n**Prod:** N/A\n",
+        _RUNTIME,
+        False,
+    ),
+    (
+        "evidence but no discriminator",
+        "## Verification\n\n**Dev:** ran the whole suite, example passed.\n"
+        "**Prod:** hit the endpoint on the box and it returned 200 OK.\n",
+        _RUNTIME,
+        False,
+    ),
+    (
+        "thin Dev",
+        "## Verification\n\n**Dev:** ok\n**Prod:** N/A - not wire-visible, nothing is wired to this path yet.\n",
+        _RUNTIME,
+        False,
+    ),
+]
+
+
+#: The `require_prod=False` mode, asserted separately: what it releases (an
+#: absent Prod), and everything it deliberately does NOT release (a present
+#: Prod is validated in full; Dev substance is unchanged). The first case is
+#: the mode's whole point and its body FAILS the full-mode `no Prod line` case
+#: above -- the pair is what proves the flag discriminates.
+_OPTIONAL_CASES: list[tuple[str, str, list[str], bool]] = [
+    (
+        "dev only, prod absent -- the released case",
+        "## Verification\n\n**Dev:** ran the whole suite, example passed.\n",
+        _RUNTIME,
+        True,
+    ),
+    (
+        "dev-only, template-shaped: evidence below the bare label",
+        "## Verification\n\n**Dev:**\n\n```\n> pytest -q\nexample passed, 0 failed\n```\n",
+        _RUNTIME,
+        True,
+    ),
+    (
+        "dev-only unedited template is still refused",
+        "## Verification\n\n**Dev:**\n",
+        _RUNTIME,
+        False,
+    ),
+    ("complete body still passes", _GOOD, _RUNTIME, True),
+    ("n/a with a reason still passes", _NA_WITH_REASON, _RUNTIME, True),
+    ("no section is still refused", "Some body text.", _RUNTIME, False),
+    (
+        "thin Dev is still refused",
+        "## Verification\n\n**Dev:** ok\n",
+        _RUNTIME,
+        False,
+    ),
+    (
+        "a PRESENT bare N/A is still refused",
+        "## Verification\n\n**Dev:** ran the whole suite, example passed.\n**Prod:** N/A\n",
+        _RUNTIME,
+        False,
+    ),
+    (
+        "PRESENT evidence without a discriminator is still refused",
+        "## Verification\n\n**Dev:** ran the whole suite, example passed.\n"
+        "**Prod:** hit the endpoint on the box and it returned 200 OK.\n",
+        _RUNTIME,
+        False,
+    ),
+]
+
+
+#: What the stripper returns, exactly, where a verdict alone cannot tell two
+#: readings apart: the text on either side of a comment survives, every
+#: comment on a line goes and not only the first, and a removed line leaves
+#: an empty one behind.
+_STRIP_CASES: list[tuple[str, str, str]] = [
+    ("text either side of a comment survives", "a <!-- b --> c", "a  c"),
+    ("every comment on a line goes", "a <!-- b --> c <!-- d --> e", "a  c  e"),
+    ("a removed line leaves an empty one", "a\n<!--\nb\n-->\nc", "a\n\n\n\nc"),
+    ("text before a mid-line opener survives", "a <!-- b\nc --> d", "a \n d"),
+    ("a marker in backticks is text, with a closer in its paragraph", "a `<!--` b\nc --> d", "a `<!--` b\nc --> d"),
+    ("a marker in a tilde fence is text", "~~~\n<!--\n~~~\n<!-- c -->d", "~~~\n<!--\n~~~\nd"),
+    ("a marker in a fence is text", "```\n<!--\n```\n<!-- c -->d", "```\n<!--\n```\nd"),
+    ("a longer fence is not closed by a shorter one", "````\n```\n<!-- a -->\n````", "````\n```\n<!-- a -->\n````"),
+]
+
+
+def _check_strip() -> int:
+    failures = 0
+    for name, body, want in _STRIP_CASES:
+        got = strip_comments(body)
+        if got != want:
+            print(f"  FAIL [strip] {name}: got {got!r}, expected {want!r}")
+            failures += 1
+        else:
+            print(f"  ok   [strip] {name}")
+    return failures
+
+
+def _run_cases(cases: list, require_prod: bool, tag: str) -> int:
+    """One pinned corpus, one prod mode. Returns the number of cases that did not do as pinned."""
+    failures = 0
+    for name, body, changed, want_clean in cases:
+        problems = check(body, changed, require_prod=require_prod)
+        got_clean = not problems
+        mark = "ok  " if got_clean == want_clean else "FAIL"
+        if got_clean != want_clean:
+            failures += 1
+        print(f"  {mark} {tag}{name}: expected {'clean' if want_clean else 'red'}")
+        if got_clean != want_clean and problems:
+            print(f"        got: {problems[0][:100]}")
+    return failures
+
+
+def _check_trigger() -> int:
+    # A checker whose own trigger has stopped firing would pass every case above by
+    # declaring nothing runtime. Assert the trigger directly, both directions.
+    failures = 0
+    if not runtime_paths(_RUNTIME):
+        print("  FAIL trigger: a runtime path was not recognised as one")
+        failures += 1
+    if runtime_paths(_DOCS) or runtime_paths(_TESTS):
+        print("  FAIL trigger: docs or tests were treated as runtime")
+        failures += 1
+    if not runtime_paths(["docker-compose.yml"]):
+        print("  FAIL trigger: docker-compose.yml was not recognised")
+        failures += 1
+    return failures
+
+
+# THE POLARITY ITSELF. Every path below read as NOT runtime before this gate
+# was flipped, and each one alters what the box does. A regression to a
+# declared scope of enforcement would make every one of them green again,
+# silently, which is why they are asserted by name rather than by prefix.
+# (The two shipped `scripts/` files were asserted here until they left with
+# their service; their SHIPPED_ANYWAY carve-outs left with them, so the
+# `^scripts/` exemption correctly covers everything that remains in that
+# directory.)
+_GATED_BY_DEFAULT = [
+    ("newservice/main.py", "a directory that did not exist when the list was written"),
+    (
+        "analytics/tests/orders_grain.sql",
+        "a dbt singular test that ships and runs on a schedule after merge (narrowed 2026-09-16)",
+    ),
+    ("tests/fixtures/rows.csv", "a fixture is not a Python test; runtime by default since the narrowing of 2026-09-16"),
+    ("backups/Dockerfile", "compose build context for postgres-backup"),
+    ("caddy/Caddyfile", "compose build context for caddy"),
+    ("uv.lock", "decides what is installed in every image"),
+]
+
+# The exemptions still have to hold, or the flip has merely made the gate
+# fire on everything, which is the failure mode that gets a control disabled.
+_STILL_EXEMPT = [
+    ".github/workflows/ci.yml",
+    ".githooks/commit-msg",
+    "scripts/check_dex_pin.py",
+    ".gitignore",
+    ".env.example",
+    "renovate.json",
+    "LICENSE",
+    "README.md",
+    "tests/test_budget_ceilings_agree.py",
+    "engine/core/tests/conftest.py",
+    "service/tests/test_routes.py",
+]
+
+
+def _check_polarity() -> int:
+    failures = 0
+    for path, why in _GATED_BY_DEFAULT:
+        if not is_runtime_path(path):
+            print(f"  FAIL polarity: {path} read as exempt -- {why}")
+            failures += 1
+    for path in _STILL_EXEMPT:
+        if is_runtime_path(path):
+            print(f"  FAIL exemption: {path} was gated and should not be")
+            failures += 1
+    return failures
+
+
+def _check_normaliser() -> int:
+    # `.github/...` above is the case that catches the normalisation defect this
+    # change fixed: `.lstrip("./")` ate the leading dot, so a dot-prefixed
+    # exemption never matched. Assert the normaliser directly too, because a
+    # future rewrite could reintroduce it while that one case still passed by
+    # some other route.
+    failures = 0
+    if _normalise("./app/x.py") != "app/x.py":
+        print("  FAIL normalise: a leading ./ was not stripped")
+        failures += 1
+    for dotfile in (".github/workflows/ci.yml", ".env.example", ".trivyignore"):
+        if _normalise(dotfile) != dotfile:
+            print(f"  FAIL normalise: {dotfile} lost its leading dot")
+            failures += 1
+    return failures
+
+
+def _check_reasons() -> int:
+    # EVERY EXEMPTION CARRIES A REASON, because a reason is what makes the list
+    # reviewable; an entry without one is a name somebody will not dare delete.
+    failures = 0
+    for pattern, why in NOT_RUNTIME:
+        if _substance(why) < _MIN_REASON:
+            print(f"  FAIL reason: the exemption {pattern!r} has no usable reason")
+            failures += 1
+    return failures
+
+
+def _check_carve_outs() -> int:
+    # Arm one over the built-in tuple needs no tree and runs here as it always
+    # did. Arm two used to look in Path.cwd(), and the four required callers
+    # run without a checkout, so it stayed green only because the built-in
+    # tuple is empty (ruled 2026-09-15). Now the resolver is injected
+    # and both arms run on a STAGED root: a present file is the positive twin,
+    # an absent one the known negative, an uncovered path the arm-one negative,
+    # and a blind read is asserted to come back as neither. Nothing here touches
+    # the caller's working directory. (The built-in tuple's own existence is
+    # asserted at check time, at the head commit, beside the input channel's.)
+    failures = 0
+    for shipped, _why in SHIPPED_ANYWAY:
+        if not any(p.search(shipped) for p, _ in _NOT_RUNTIME_RES):
+            print(f"  FAIL carve-out: nothing exempts {shipped}, so naming it here")
+            print("        asserts a hole that does not exist")
+            failures += 1
+    return failures + _check_staged_carve_outs()
+
+
+def _check_staged_carve_outs() -> int:
+    failures = 0
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "scripts").mkdir()
+        (root / "scripts" / "present.py").write_text("# staged twin\n", encoding="utf-8")
+        entries = (
+            ("scripts/present.py", "the positive twin: covered, and in the staged tree"),
+            ("scripts/gone.py", "the known negative: covered, and not in the tree"),
+            ("app/main.py", "the arm-one negative: no exemption covers it"),
+        )
+        dead, blind = carve_out_problems(entries, tree_resolver(root))
+    if blind or any(d.startswith("scripts/present.py:") for d in dead):
+        print("  FAIL carve-out: the present twin was reported dead or blind")
+        failures += 1
+    if not any(d.startswith("scripts/gone.py:") and "not in the tree" in d for d in dead):
+        print("  FAIL carve-out: the absent entry was not reported dead")
+        failures += 1
+    if not any(d.startswith("app/main.py:") and "nothing exempts" in d for d in dead):
+        print("  FAIL carve-out: an entry no exemption covers was not refused")
+        failures += 1
+    dead, blind = carve_out_problems(
+        (("scripts/present.py", "x"),), lambda _path: ("blind", "HTTP 403")
+    )
+    if dead or len(blind) != 1 or "HTTP 403" not in blind[0]:
+        print("  FAIL carve-out: a blind read was not reported apart, naming its status")
+        failures += 1
+    return failures
+
+
+def _check_shipped_anyway_channel() -> int:
+    # THE PER-REPOSITORY CARVE-OUT CHANNEL, exercised in both directions -- a
+    # parser that refused everything would read exactly like one that worked,
+    # and one that refused nothing would quietly re-open the fail-open registry
+    # this input exists to avoid. Three arms: a valid entry makes an exempt
+    # path runtime; an entry carving no hole is refused; a reasonless entry is
+    # refused.
+    failures = 0
+    carved = parse_shipped_anyway(
+        ["scripts/example_shipped.py -- an entrypoint a compose service executes"]
+    )
+    if exemption_for("scripts/example_shipped.py", carved) is not None:
+        print("  FAIL shipped-anyway: a declared carve-out did not make the path runtime")
+        failures += 1
+    if exemption_for("scripts/other.py", carved) is None:
+        print("  FAIL shipped-anyway: a carve-out for one file un-exempted its neighbours")
+        failures += 1
+    for bad in (
+        "app/main.py -- already runtime, carves nothing",
+        "scripts/x.py -- no",
+        "scripts/x.py",
+    ):
+        try:
+            # The refusal text goes to a buffer, not the log: these arms are
+            # negative controls, and a raw "could NOT check:" line inside a
+            # GREEN run's log reads as an error somebody should chase --
+            # observed on the first adopter's CI run before this redirect.
+            with contextlib.redirect_stderr(io.StringIO()):
+                parse_shipped_anyway([bad])
+        except SystemExit:
+            pass
+        else:
+            print(f"  FAIL shipped-anyway: {bad!r} was accepted and must not be")
+            failures += 1
+    return failures
+
+
+def self_test() -> int:
+    # One section per helper, so the estate's cyclomatic ceiling reads each
+    # independent block rather than their sum; the sections, their order and
+    # every printed line are unchanged from the single-function form.
+    failures = _run_cases(_CASES, True, "")
+    failures += _run_cases(_OPTIONAL_CASES, False, "[no-require-prod] ")
+    failures += _run_cases(_COMMENT_CASES, True, "[comments] ")
+    failures += _run_cases(_COMMENT_CASES, False, "[comments, no-require-prod] ")
+    failures += _check_strip()
+    failures += _check_trigger()
+    failures += _check_polarity()
+    failures += _check_normaliser()
+    failures += _check_reasons()
+    failures += _check_carve_outs()
+    failures += _check_shipped_anyway_channel()
+
+    if failures:
+        print(f"\nself-test FAILED: {failures} case(s)", file=sys.stderr)
+        return 1
+    print(
+        f"\nself-test OK: {len(_CASES)} + {len(_OPTIONAL_CASES)} cases "
+        f"(both prod modes), {len(_COMMENT_CASES)} comment cases in each mode, "
+        f"{len(_STRIP_CASES)} strip cases, "
+        f"3 trigger assertions, "
+        f"{len(_GATED_BY_DEFAULT)} polarity, {len(_STILL_EXEMPT)} exemption, "
+        f"{len(NOT_RUNTIME)} reasons, {len(SHIPPED_ANYWAY)} carve-outs + 4 "
+        f"resolver arms (present, absent, uncovered, blind), "
+        f"shipped-anyway 2+3 arms"
+    )
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("body", nargs="?", help="file holding the PR body")
+    parser.add_argument(
+        "--changed-files",
+        help="file holding one changed path per line (from `gh pr view --json files`)",
+    )
+    parser.add_argument("--label", default="PR body", help="what to call the input")
+    parser.add_argument(
+        "--require-prod",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "whether `Prod:` (and its Discriminator) are REQUIRED. "
+            "--no-require-prod is the library-repo mode (ruled 2026-08-28): no box "
+            "exists to observe, so an absent Prod is a complete answer -- but a "
+            "present one is still validated in full."
+        ),
+    )
+    parser.add_argument(
+        "--shipped-anyway",
+        action="append",
+        default=[],
+        metavar="PATH -- REASON",
+        help=(
+            "per-repository carve-out: a path production ships despite an "
+            "exemption covering its directory (the action's shipped-anyway "
+            "input). Refused unless it carves a real hole and carries a reason."
+        ),
+    )
+    parser.add_argument(
+        "--head-sha",
+        help=(
+            "the pull request's head commit. Required when any carve-out is "
+            "declared: each is asserted to still name a file at that commit, "
+            "through the contents API with GH_TOKEN and GH_REPO (ruled 2026-09-15)."
+        ),
+    )
+    parser.add_argument("--self-test", action="store_true", help="prove it can go red")
+    args = parser.parse_args(argv)
+
+    if args.self_test:
+        return self_test()
+
+    if not args.body or not args.changed_files:
+        print(
+            "could NOT check: both a body file and --changed-files are required. "
+            "Exiting 1 rather than 0, because 'nothing scanned' must never read as "
+            "'all clear'.",
+            file=sys.stderr,
+        )
+        return 1
+
+    body = Path(args.body).read_text(encoding="utf-8")
+    raw = Path(args.changed_files).read_text(encoding="utf-8").splitlines()
+    changed = [line for line in raw if line.strip()]
+    if not changed:
+        print(
+            "could NOT check: the changed-file list is empty. A PR always changes "
+            "something, so this means the list was not produced.",
+            file=sys.stderr,
+        )
+        return 1
+
+    extra_shipped = parse_shipped_anyway(args.shipped_anyway)
+    entries = tuple(SHIPPED_ANYWAY) + tuple(extra_shipped)
+    if entries:
+        rc = _check_live_carve_outs(entries, args.head_sha)
+        if rc:
+            return rc
+    touched = runtime_paths(changed, extra_shipped)
+    if not touched:
+        # Name the exemption that covered each file, rather than reporting a
+        # count. A success line that counts its own list tells you the list was
+        # read, not that anything was checked -- a sibling checker once reported
+        # the size of its own map, byte-identical whether or not the thing it
+        # existed to notice had happened.
+        print(
+            f"{args.label}: no runtime paths changed -- verification section not "
+            f"required. {len(changed)} file(s), each exempt for a stated reason:"
+        )
+        for path in changed:
+            print(f"  {path.strip()}: {exemption_for(path, extra_shipped)}")
+        return 0
+
+    problems = check(
+        body, changed, require_prod=args.require_prod, extra_shipped=extra_shipped
+    )
+    if problems:
+        print(f"{args.label}: verification section FAILED\n", file=sys.stderr)
+        for p in problems:
+            print(f"  - {p}", file=sys.stderr)
+        print(
+            "\nRuntime paths in this PR: " + ", ".join(touched[:8]),
+            file=sys.stderr,
+        )
+        return 1
+
+    fields_ok = (
+        "Dev/Prod present" if args.require_prod
+        else "Dev present; Prod not required here"
+    )
+    print(
+        f"{args.label}: verification section OK "
+        f"({len(touched)} runtime path(s) changed, {fields_ok})"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

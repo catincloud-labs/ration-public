@@ -1,0 +1,89 @@
+name: pr-hygiene
+
+# A separate workflow for ONE reason: `types:` is a workflow-level key, and
+# this is the job that must re-run when a PR **body** or its **labels** change.
+# The default `pull_request` types omit `edited`, so a body edited after
+# opening would never be re-scored.
+#
+# The job id below MUST stay `pr-hygiene`. It is a required status check, and
+# a required check is matched by its context string: a rename does not fail --
+# the check simply never reports, and a check that never reports never blocks
+# a merge.
+#
+# The two checkers it runs are byte-identical copies under `scripts/`, held
+# unmodified for the reason the head of `checks.yml` gives. Each one's
+# self-test runs first: a gate that silently stopped matching is
+# indistinguishable from a well-verified pull request.
+
+on:
+  pull_request:
+    branches: [main]
+    # `labeled` and `unlabeled` are for the deploy-label step, whose whole
+    # remedy is *apply the label*: neither is in the default types, and
+    # `edited` is title, body and base, not labels. Without them a pull request
+    # opened unlabelled stays red after the label is applied, until something
+    # pushes a commit.
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
+
+concurrency:
+  group: pr-hygiene-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pr-hygiene:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      # Checkout is load-bearing: the checkers are read from this tree.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Self-test the verification-section checker
+        run: python3 scripts/check_verification_section.py --self-test
+
+      # Dev-required, Prod-not-required: no box runs a library, and a field
+      # that is structurally always N/A trains the reflex of writing N/A. A
+      # `Prod:` line that IS present is still validated in full, because a
+      # present claim is a claim.
+      #
+      # Separate `gh` calls into files, never a pipe into python3: a pipe
+      # reports the tail's exit code and would hide a failed `gh` behind a
+      # green check.
+      - name: Assert the PR says how it was verified
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          gh pr view "$PR" --json body --jq '.body // ""' > "$RUNNER_TEMP/body.txt"
+          gh pr view "$PR" --json files --jq '.files[].path' > "$RUNNER_TEMP/files.txt"
+          gh pr view "$PR" --json headRefOid --jq '.headRefOid' > "$RUNNER_TEMP/head.txt"
+          echo "changed files:"; cat "$RUNNER_TEMP/files.txt"
+          python3 scripts/check_verification_section.py "$RUNNER_TEMP/body.txt" \
+            --changed-files "$RUNNER_TEMP/files.txt" --label "PR #$PR body" \
+            --head-sha "$(cat "$RUNNER_TEMP/head.txt")" \
+            --no-require-prod
+
+      # Exactly one `deploy:` label, or the pull request is unclassified and
+      # reads red. The labels come from the event payload and reach the script
+      # through the environment, never interpolated into shell, because a label
+      # name is repository-controlled text. Dependabot is exempt by author, and
+      # the exemption prints, with its closing condition, whenever it fires.
+      #
+      # `!cancelled()` on both, so a refused body does not hide a missing
+      # label, or the other way round. A label change does not move the head
+      # commit, so a red run and the green one after it both stay on the
+      # commit: read the LATEST run of this job.
+      - name: Self-test the deploy-label checker
+        if: ${{ !cancelled() }}
+        run: python3 scripts/check_deploy_label.py --self-test
+
+      - name: Exactly one deploy label
+        if: ${{ !cancelled() }}
+        env:
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels) }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: python3 scripts/check_deploy_label.py --labels-json "$PR_LABELS" --author "$PR_AUTHOR"

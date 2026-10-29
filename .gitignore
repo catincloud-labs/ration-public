@@ -1,0 +1,34 @@
+# Python build and cache. This is a package, so these rules are load-bearing
+# from day one rather than added after the first slip.
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Test and type-check caches.
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Environment and key material. Nothing here needs credentials yet, which is
+# exactly when this is cheap to add: a key committed once is compromised even
+# after the file is deleted, so the rule has to predate the key. A backend
+# talking to a real store is a plausible way for one to arrive.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Local agent configuration -- machine-specific absolute paths and permission
+# allowlists, which are a property of one workstation rather than of this project.
+.claude/
+
+# OS junk
+.DS_Store
+Thumbs.db

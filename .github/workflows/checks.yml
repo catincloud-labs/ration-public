@@ -1,0 +1,385 @@
+name: checks
+
+# `edited` is here on purpose. A body edit is the normal way an unacknowledged
+# close gets introduced or removed, so without it a corrected body never
+# re-runs and a broken one never re-checks. `synchronize` covers pushes to the
+# branch.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+  # `issues: read` is what makes `closingIssuesReferences` return anything at
+  # all. Without it the field resolves to an EMPTY LIST rather than erroring,
+  # and the reconcile step reads that as "merging this closes nothing" -- so
+  # the check cannot tell *no closing reference* from *cannot see one*. The
+  # silent half is the dangerous one: a stray closing keyword under an
+  # `Autoclose: none` trailer reconciles CLEAN, because a blind "nothing"
+  # agrees with a trailer claiming nothing.
+  issues: read
+
+# The job names below are load-bearing. `markdown`, `closing keywords` and
+# `tests` are required status checks, and a required check is matched by its
+# context string and nothing else. A rename does not fail -- the check simply
+# never reports, and a check that never reports never blocks a merge. The gate
+# goes quiet rather than red.
+#
+# EVERY CHECK HERE RUNS FROM THIS REPOSITORY'S OWN TREE. The guards under
+# `scripts/` are byte-identical copies of checkers maintained in a private
+# repository, which a public repository's workflow cannot call. They are
+# compared byte for byte against their source from the private side, so do not
+# edit them here: a copy edited to suit local taste is a copy that will be
+# reported as drifted. The cost, stated rather than discovered: drift is
+# caught after it lands, not blocked on the pull request that introduces it.
+# Each guard's self-test runs before the guard, so a checker that has silently
+# stopped detecting anything goes red here rather than passing everything.
+jobs:
+  markdown:
+    name: markdown
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The config is passed explicitly and lives at `.github/markdownlint.json`
+      # rather than at the root, where it would be auto-discovered and read as a
+      # decision this repository made. It is a copy of the shared default.
+      # Without `--config` the CLI falls back to its own defaults, where MD013
+      # and MD041 are both ON, so a wrong path must fail loudly (ENOENT) rather
+      # than lint quietly against the wrong rules.
+      - name: markdownlint
+        run: npx -y markdownlint-cli2 --config .github/markdownlint.json '*.md' '.github/**/*.md'
+
+  closing-keywords:
+    name: closing keywords
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Guard fires and goes quiet
+        run: python scripts/test_check_closing_keywords.py
+
+      - name: Scan the pull request body
+        run: |
+          gh pr view "$PR" --json body -q .body > "$RUNNER_TEMP/pr-body.md"
+          python scripts/check_closing_keywords.py "$RUNNER_TEMP/pr-body.md"
+
+      - name: Scan every commit message in the pull request
+        run: |
+          gh pr view "$PR" --json commits \
+            -q '.commits[].messageHeadline + "\n" + .commits[].messageBody' \
+            > "$RUNNER_TEMP/pr-commits.txt"
+          python scripts/check_closing_keywords.py "$RUNNER_TEMP/pr-commits.txt"
+
+      # Blind is not empty. A pull request is itself an issue in GitHub's
+      # model, so an issues listing that comes back empty during a pull-request
+      # run is a token that cannot see issues, and the reconcile below would
+      # read its empty answer as "closes nothing".
+      - name: The token can see issues at all
+        run: |
+          if ! seen="$(gh api "repos/$GITHUB_REPOSITORY/issues?state=all&per_page=1" --jq 'length' 2>"$RUNNER_TEMP/sight.err")"; then
+            echo "::error::This token cannot list issues, so it cannot see what merging will close."
+            cat "$RUNNER_TEMP/sight.err"
+            exit 1
+          fi
+          if [ "${seen:-0}" -lt 1 ]; then
+            echo "::error::The issues listing came back empty during a pull-request run: a token that cannot see issues."
+            exit 1
+          fi
+          echo "OK - the token can see issues (listing returned $seen)."
+
+      # The regex is a reimplementation; GitHub's own field is the authority.
+      # This step fetches and the script decides, so the rule has one reader.
+      # The field lags a body edit by tens of seconds and reads empty right
+      # after a pull request opens, so one disagreement is asked again.
+      - name: Ask GitHub what it will actually close
+        run: |
+          gh pr view "$PR" --json body -q .body > "$RUNNER_TEMP/pr-body-reconcile.md"
+          attempt() {
+            reported="$(
+              gh pr view "$PR" --json closingIssuesReferences \
+                -q '[.closingIssuesReferences[].number] | sort | join(",")'
+            )"
+            python scripts/check_closing_keywords.py \
+              --github-closes "$reported" \
+              "$RUNNER_TEMP/pr-body-reconcile.md" \
+              > "$RUNNER_TEMP/reconcile.txt" 2>&1
+          }
+          if attempt; then
+            cat "$RUNNER_TEMP/reconcile.txt"
+            exit 0
+          fi
+          echo "Disagreement on first read; the field lags an edit. Re-asking in 30s."
+          sleep 30
+          if attempt; then
+            cat "$RUNNER_TEMP/reconcile.txt"
+            exit 0
+          fi
+          cat "$RUNNER_TEMP/reconcile.txt"
+          echo "::error::GitHub and the Autoclose trailer disagree about what merging this will close."
+          exit 1
+
+  # A real store, because every other implementation the suite runs is a fake
+  # this repository wrote -- including the one expected to pass. A green run of
+  # fakes shows the suite can discriminate and shows nothing about any store.
+  #
+  # Not a matrix, however tempting a second interpreter is: a matrix renames
+  # this to `tests (3.13)` and the required check `tests` never reports. A
+  # second interpreter is a second job with its own name, below.
+  tests:
+    name: tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: ration
+          POSTGRES_PASSWORD: ration
+          POSTGRES_DB: ration
+        ports:
+          - 5432:5432
+        # Without this the suite starts before the server accepts connections
+        # and fails on something that is not a conformance result.
+        options: >-
+          --health-cmd "pg_isready -U ration"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      RATION_POSTGRES_DSN: postgresql://ration:ration@localhost:5432/ration
+      # Turns a missing backend red rather than quiet. Without it, a service
+      # container that failed to start or a dropped environment variable would
+      # leave the suite passing on fakes alone, with exactly the same green
+      # tick. Asserted by `tests/test_the_suite_discriminates.py`.
+      RATION_REQUIRE_POSTGRES: "1"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.13'
+
+      # Editable, so the suite runs against the working tree rather than a
+      # copy whose staleness would be invisible.
+      - name: Install the package and the suite's dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      # pytest exits 5 when it collected nothing, and a job that ran an empty
+      # suite must not report the same green as one that ran a real one.
+      - name: The suite
+        run: |
+          set +e
+          python -m pytest
+          status=$?
+          set -e
+          if [ "$status" -eq 5 ]; then
+            echo "::error::pytest collected no tests, which would otherwise read as a pass."
+            exit 1
+          fi
+          exit "$status"
+
+  # The floor of `requires-python`, exercised rather than asserted. A second
+  # job rather than a matrix, for the reason above; the name is written exactly
+  # as a matrix would have produced it, so converting later breaks no gate. It
+  # duplicates the `services:` block on purpose: a service container is
+  # topology, and the two jobs must be free to diverge. It reports and does not
+  # gate. Delete it only together with the floor it defends.
+  tests-3-12:
+    name: tests (3.12)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: ration
+          POSTGRES_PASSWORD: ration
+          POSTGRES_DB: ration
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ration"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      RATION_POSTGRES_DSN: postgresql://ration:ration@localhost:5432/ration
+      # The older interpreter is exactly where a driver would silently fail to
+      # install, so a run on fakes alone is red here too.
+      RATION_REQUIRE_POSTGRES: "1"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Install the package and the suite's dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+      - name: The suite
+        run: |
+          set +e
+          python -m pytest
+          status=$?
+          set -e
+          if [ "$status" -eq 5 ]; then
+            echo "::error::pytest collected no tests, which would otherwise read as a pass."
+            exit 1
+          fi
+          exit "$status"
+
+  # A pull-request title becomes the merge commit history cites, so it takes
+  # the conventional-commit form (`AGENTS.md`, Change workflow). Advisory.
+  #
+  # Each non-merge commit in the pull request is judged too, since a pull
+  # request here merges with a merge commit and every commit on its branch
+  # lands on `main` as written: its subject by the title's form rules,
+  # without the 100-character cap, and a body beyond its trailers.
+  pr-title:
+    name: pr title
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Guard fires and goes quiet
+        run: python scripts/check_pr_title.py --self-test
+
+      # REST rather than `gh pr view --json commits`: the listing carries each
+      # commit's parents, which is how a merge commit is told apart and
+      # skipped, and the whole message. It lists at most 250 commits; the
+      # event's count and head are passed beside it, so a longer pull request,
+      # a listing that stopped early, or a branch that moved after the event is
+      # refused as unread rather than judged on what was seen.
+      #
+      # The listing is read once, with no retry: the shared action wraps the
+      # read in a retry helper this repository does not vendor. So a transient
+      # API error turns this advisory job red, and a re-run reads it again. It
+      # fails closed either way: an error exits non-zero, and a short read is
+      # refused.
+      - name: Read the pull request's commits
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/commits?per_page=100" \
+            --jq '.[] | {sha, parents: (.parents | length), message: .commit.message}' \
+            > "$RUNNER_TEMP/pr-title-commits.jsonl"
+
+      # The title reaches the script through the environment, never
+      # interpolated into shell: a title is attacker-adjacent text on a public
+      # repository.
+      - name: Judge the title and the commits
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_COMMITS: ${{ github.event.pull_request.commits }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python scripts/check_pr_title.py --title "$PR_TITLE" --author "$PR_AUTHOR" \
+            --commits "$RUNNER_TEMP/pr-title-commits.jsonl" \
+            --commits-expected "$PR_COMMITS" --head-sha "$PR_HEAD"
+
+  # Refuses the `pull_request_target` trigger in this repository's workflows,
+  # naming file and line: that trigger runs with the base repository's token
+  # and secrets and can be made to run a fork's code. A use is allowed only by
+  # `# allow pull_request_target: <reason>` on the trigger's own line, and
+  # each allowed use is printed. It reads the checked-out tree, so it runs on
+  # a push as well as on a pull request. Advisory.
+  #
+  # The three steps are the shared action's three, written out, like the
+  # other guards here. `scripts/check_pull_request_target.py` and its
+  # manifest, `scripts/pull_request_target_requirements.txt`, are
+  # byte-identical copies, so do not edit them here. The checker parses
+  # YAML, so the first step installs the PyYAML the manifest pins, and
+  # Dependabot's `pip` entry for `/scripts` moves that pin.
+  pull-request-target:
+    name: pull request target
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: PyYAML at the version the manifest pins
+        run: |
+          python3 -m pip install --requirement scripts/pull_request_target_requirements.txt
+          python3 -c 'import yaml; print(f"PyYAML {yaml.__version__} imported from {yaml.__file__}")'
+
+      - name: Guard fires and goes quiet
+        run: python3 scripts/check_pull_request_target.py --self-test
+
+      - name: No workflow triggers on pull_request_target unallowed
+        run: python3 scripts/check_pull_request_target.py --root .
+
+  # Every third-party action ref in this tree is a forty-character commit with
+  # its version as a trailing comment, from a publisher the checker enumerates.
+  # It scans every `.github/**/*.yml|yaml` the pull request proposes, never a
+  # named file, and refuses a tag, a bare hash or a stranger's publisher.
+  # Dependabot (`.github/dependabot.yml`) is the mover; this is what makes a
+  # hand edit at a tag visible. Advisory.
+  third-party-pins:
+    name: third-party pins
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Guard fires and goes quiet
+        run: python3 scripts/test_check_third_party_pins.py
+
+      - name: Every third-party ref in this tree is a commit with its version
+        env:
+          ORG: ${{ github.repository_owner }}
+        run: python3 scripts/check_third_party_pins.py --org "$ORG" --tree .
+
+  # The coding standard, the Power of 10, read per class against the tree the
+  # pull request proposes. `src` is class A -- a failure there reaches the
+  # lease this package exists to hold -- so it is read at cyclomatic ceiling 10
+  # with strict typing: no recursion, no `while True`, no `global`, no blind
+  # `except`, every function annotated. `tests/` and `scripts/` are class C at
+  # ceiling 15 without being named. The interpreter is the floor of
+  # `requires-python`. The tool versions are written once, in
+  # `scripts/power_of_ten_requirements.txt`, which Dependabot's `pip` entry
+  # moves. A deviation is a `noqa` or `type: ignore[code]` naming the rule with
+  # its reason on the same line. Advisory.
+  power-of-ten:
+    name: power of ten
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+
+      - name: The pinned tools
+        run: |
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet --requirement scripts/power_of_ten_requirements.txt
+          python -m ruff --version
+          python -m mypy --version
+
+      - name: Guard fires and goes quiet
+        run: python scripts/test_check_power_of_ten.py
+
+      # The base sha is the pull request's, or empty on a push: the checker
+      # reads the BASE's workflows to decide whether the ratchet runs, so
+      # nothing the head can set decides it.
+      - name: Every class reads clean at its ceiling, and the baseline did not grow
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python scripts/check_power_of_ten.py --tree . --class-a src --base-sha "$BASE_SHA"

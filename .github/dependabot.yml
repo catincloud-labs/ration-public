@@ -1,0 +1,41 @@
+version: 2
+
+updates:
+  # Two ecosystems, each with a reason.
+  #
+  # `github-actions`: every third-party action is pinned to a forty-character
+  # commit with its version as a trailing comment, and a pin needs a mover.
+  # Grouped and monthly, so a month's bumps arrive as one pull request read as a
+  # diff of commit hashes and version comments; the `third party pins` job is
+  # what makes that reading mean something.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      github-actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "chore(deps)"
+
+  # `pip`, for `/scripts` only: the tools that read the coding standard are
+  # pinned by version, once, in `scripts/power_of_ten_requirements.txt`, and the
+  # pin has a mover. That file is a byte-identical copy of the checker's own
+  # manifest (see the head of `.github/workflows/checks.yml`), so a bump lands
+  # here as a pull request and the copy reads as drifted until its source
+  # moves too.
+  #
+  # The same entry moves `scripts/pull_request_target_requirements.txt`, the
+  # PyYAML pin the `pull request target` job installs, which is a
+  # byte-identical copy of that guard's own manifest.
+  #
+  # `pip` is deliberately absent for the package itself. Its runtime
+  # dependency list is empty, and the drivers in the `dev` extra are floors
+  # for the suite, not pins: which store a deployment uses is decided by the
+  # conformance suite's result, not by a version a bot raises.
+  - package-ecosystem: pip
+    directory: /scripts
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "chore(deps)"
