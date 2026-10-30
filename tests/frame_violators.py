@@ -12,8 +12,12 @@ Each class removes exactly one check, and each is the shape a shortcut takes.
 pass over the body" removes the integrity check. "The header is tiny, hash the
 body" leaves the header out of the integrity check. "Requests are idempotent"
 removes the sequence check. A 32-bit counter is what a sender restart rule
-looks like when nobody wrote one. None of them is contrived; each is what the
-tree would contain if the check had been left for later.
+looks like when nobody wrote one. The text form has three of its own: "the
+library decodes base64" removes the strict read, "the header is already
+bytes" removes the decode, and "the library's strict flag is strict" removes
+the round trip that makes a frame's text the only one. None of them is
+contrived; each is what the tree would contain if the check had been left for
+later.
 
 Where a violator must break two things to break one, it says so and declares
 both in `tests/support/codecs.py`.
@@ -21,12 +25,14 @@ both in `tests/support/codecs.py`.
 
 from __future__ import annotations
 
+import base64
 import zlib
 
 from ration.frame import (
     _CHECKED_HEADER,
     _HEADER,
     HEADER_SIZE,
+    MALFORMED_TEXT,
     SEQUENCE_DUPLICATE,
     SEQUENCE_GAP,
     SEQUENCE_REPLAYED,
@@ -42,7 +48,10 @@ __all__ = [
     "CrcBeforeVersionCodec",
     "CounterOnlyCodec",
     "IgnoresTrailingCodec",
+    "LenientTextCodec",
+    "NonCanonicalTextCodec",
     "SequencesBeforeCheckingCodec",
+    "SkipsTextDecodeCodec",
     "UncheckedCrcCodec",
     "UncheckedKindCodec",
     "UncheckedLengthCodec",
@@ -248,3 +257,52 @@ class SequencesBeforeCheckingCodec(FrameCodec):
         if refused is not None:
             return refused
         return Frame(kind=kind, sequence=sequence, body=body)
+
+
+class LenientTextCodec(FrameCodec):
+    """Violates: `frame-text`. Reads the text with the standard library's defaults.
+
+    `base64.urlsafe_b64decode` with the padding put back is what reading
+    base64url looks like when nobody decided how strictly to read it. It drops
+    a character outside its alphabet and returns the bytes the text held
+    without it, skips whitespace, takes padding, takes the standard alphabet's
+    `+` and `/` beside base64url's own, and reads a last character's unused
+    bits as zero. Each of those is a text no sender wrote, read as a frame a
+    sender did; only what the library itself raises on is refused.
+    """
+
+    def from_text(self, text: str) -> bytes | FrameRefusal:
+        try:
+            return base64.urlsafe_b64decode(text + "==")
+        except ValueError as error:
+            return FrameRefusal(MALFORMED_TEXT, str(error))
+
+
+class SkipsTextDecodeCodec(FrameCodec):
+    """Violates: `frame-text`. Hands the header to the frame reader as it arrived.
+
+    A route that forgot the text form: the header's value is already a string
+    of bytes, so it goes to the frame's checks undecoded. Every text, healthy
+    or not, is refused by whichever frame check its first bytes land on --
+    the first character of any v1 frame's text is `A`, a frame version this
+    reader does not speak -- so a healthy text is refused, and a malformed one
+    is refused under a name that blames the frame for a fault in the text.
+    """
+
+    def from_text(self, text: str) -> bytes | FrameRefusal:
+        # The raw value an HTTP server hands over, which is latin-1 bytes.
+        return text.encode("latin-1", "replace")
+
+
+class NonCanonicalTextCodec(FrameCodec):
+    """Violates: `frame-text`. Every check but the round trip.
+
+    The alphabet and the length are checked, which is as far as the standard
+    library's strict settings go: `validate=True`, and `binascii.a2b_base64`
+    with `strict_mode=True`, both read a last character whose unused bits are
+    not zero as the same bytes as the canonical one. So two texts decode to one
+    frame, and the one this reader also accepts was written by no encoder.
+    """
+
+    def text_canonical(self, text: str, data: bytes) -> FrameRefusal | None:
+        return None

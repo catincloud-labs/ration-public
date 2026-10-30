@@ -27,6 +27,7 @@ from ration.frame import (
     FINGERPRINT,
     FRAME_VERSION,
     HEADER_SIZE,
+    ROLE_CLAIM,
     Frame,
     FrameCodec,
     FrameRefusal,
@@ -38,7 +39,10 @@ from tests.frame_violators import (
     CounterOnlyCodec,
     CrcBeforeVersionCodec,
     IgnoresTrailingCodec,
+    LenientTextCodec,
+    NonCanonicalTextCodec,
     SequencesBeforeCheckingCodec,
+    SkipsTextDecodeCodec,
     UncheckedCrcCodec,
     UncheckedKindCodec,
     UncheckedLengthCodec,
@@ -46,12 +50,18 @@ from tests.frame_violators import (
     UncheckedVersionCodec,
 )
 
-__all__ = ["CODECS", "BODY", "CodecCase", "CodecUnderTest"]
+__all__ = ["CODECS", "BODY", "CLAIM", "CodecCase", "CodecUnderTest"]
 
 #: A body in the shape a frame carries: canonical JSON, which this suite never
 #: decodes. Its content is irrelevant to every check and its length is not --
 #: long enough that a flipped bit has somewhere to land that is not the header.
 BODY = b'{"payload":{"layers":{"models":"9f2c"},"models":["a","b"]},"payload_kind":"fingerprint"}'
+
+#: A claim-only body, the shape `role-claim` names, which this suite never
+#: decodes either. Its length is chosen, not incidental: it makes a 41-byte
+#: frame, which is not a multiple of three, so the frame's text ends in a
+#: character with unused bits -- the bits a non-canonical text sets.
+CLAIM = b'{"role_version":315821}'
 
 
 @dataclass
@@ -72,6 +82,14 @@ class CodecUnderTest:
 
     def healthy(self, sequence: Sequence, body: bytes = BODY) -> bytes:
         return self.codec.encode(FINGERPRINT, sequence, body)
+
+    def healthy_text(self, sequence: Sequence, body: bytes = CLAIM) -> str:
+        """A claim frame in the text form a request header carries."""
+        return self.codec.encode_text(ROLE_CLAIM, sequence, body)
+
+    def decode_text(self, text: str) -> Frame | FrameRefusal:
+        """Decode `text` against a ledger that has seen nothing, for the reason `decode` gives."""
+        return self.codec.decode_text(text, SequenceLedger())
 
     def decode(self, data: bytes, sender: str | None = None) -> Frame | FrameRefusal:
         """Decode `data`; with no `sender`, against a ledger that has seen nothing.
@@ -168,4 +186,9 @@ CODECS: list[CodecCase] = [
         {"frame-sequence"},
         SequencesBeforeCheckingCodec,
     ),
+    _case("lenient-text", {"frame-text"}, LenientTextCodec),
+    _case("skips-text-decode", {"frame-text"}, SkipsTextDecodeCodec),
+    # The standard library's strict settings, as a codec: every character
+    # checked, and a last character's unused bits never looked at.
+    _case("accepts-non-canonical", {"frame-text"}, NonCanonicalTextCodec),
 ]
