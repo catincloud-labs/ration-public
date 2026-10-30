@@ -6,9 +6,18 @@ reader of it must refuse every string that is not the text form as
 well-formed text holds to the frame's checks unchanged -- so a fault in the
 text is the text's refusal, and a fault in the bytes is the frame's. Violated
 by `lenient-text`, which reads with the standard library's defaults; by
-`skips-text-decode`, which hands the header to the frame reader undecoded; and
-by `accepts-non-canonical`, which checks every character and never the round
-trip.
+`library-strict`, which reads with its strict base64url setting; by
+`skips-text-decode`, which hands the header to the frame reader undecoded; by
+`accepts-non-canonical`, which checks every character against base64url and
+never the round trip; by `drops-dangling-character`, which reads a dangling
+character as nothing, as Node's `Buffer` does; and by `collapses-layers`,
+which answers the frame's refusals as the text's.
+
+One arm is separated by no registered reader: a character outside ASCII,
+which every reader here refuses as text because the standard library raises
+on it. A reader that normalised the text to NFKC first would turn a fullwidth
+letter into its ASCII twin and fail the arm; none is registered, because
+normalising a header is not a shortcut anyone takes by accident.
 
 The frame here is a `role-claim` frame around a claim-only body, which is the
 use the form exists for. Every text is decoded against a ledger that has seen
@@ -19,6 +28,7 @@ decided with the sequence held still.
 from __future__ import annotations
 
 import base64
+import binascii
 import string
 
 import pytest
@@ -47,6 +57,23 @@ INSIDE = 20
 #: every reader writes alike. The CRC's characters differ by reader, and
 #: `body-only-crc` writes one with no `-` or `_` in it.
 EPOCH = 63
+
+#: A claim body one byte shorter than `CLAIM`: a 40-byte frame, whose text is
+#: two characters past a multiple of four, so its last character carries four
+#: unused bits where `CLAIM`'s carries two.
+SHORT_CLAIM = b'{"role_version":12345}'
+
+
+def library_readings(text: str) -> set[bytes]:
+    """What the standard library reads `text` as: by default, and at its strictest."""
+    padded = text + "=" * (-len(text) % 4)
+    return {
+        base64.urlsafe_b64decode(padded),
+        base64.b64decode(padded, altchars=b"-_", validate=True),
+        binascii.a2b_base64(
+            padded.replace("-", "+").replace("_", "/").encode("ascii"), strict_mode=True
+        ),
+    }
 
 
 @pytest.mark.conformance("frame-text")
@@ -95,15 +122,21 @@ def test_only_the_canonical_text_is_read_as_a_frame(codec: CodecUnderTest) -> No
     refused_as_text(healthy[:-2], "a text one character past a multiple of four")
 
     # A last character whose unused bits are set. It holds the SAME bytes as
-    # the healthy text under the standard library's reading, strict or not,
-    # which is why the check is a round trip and not a character scan.
-    noncanonical = healthy[:-1] + ALPHABET[ALPHABET.index(healthy[-1]) | 1]
-    assert noncanonical != healthy
-    padding = "=" * (-len(healthy) % 4)
-    assert base64.urlsafe_b64decode(noncanonical + padding) == base64.urlsafe_b64decode(
-        healthy + padding
-    ), "the two texts must hold one frame, or this arm decides nothing"
-    refused_as_text(noncanonical, "a second text of the same frame")
+    # the canonical text under the standard library's reading, strict or not,
+    # which is why the check is a round trip and not a character scan. Both
+    # length classes, every unused bit: two bits after two whole bytes, four
+    # after one, so a reader that masks only the narrower case is caught.
+    short = codec.healthy_text(Sequence.start(EPOCH), SHORT_CLAIM)
+    assert (len(healthy) % 4, len(short) % 4) == (3, 2)
+    for canonical, unused in ((healthy, 2), (short, 4)):
+        for bit in range(unused):
+            index = ALPHABET.index(canonical[-1])
+            assert not index & (1 << bit), "a canonical text sets no unused bit"
+            second = canonical[:-1] + ALPHABET[index | 1 << bit]
+            assert library_readings(second) == library_readings(canonical), (
+                "the two texts must hold one frame, or this arm decides nothing"
+            )
+            refused_as_text(second, f"a second text of the same frame (unused bit {bit})")
 
     # The other half: a fault in the BYTES a well-formed text holds is not the
     # text's to refuse. Swapping the first character for another inside the

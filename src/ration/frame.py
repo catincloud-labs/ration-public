@@ -113,9 +113,13 @@ and this module does not name one.
 The leniency is not hypothetical. Python's default `base64.b64decode` drops a
 character outside its alphabet silently and returns the bytes the text held
 before the character was added, so a reader built on it accepts a text no
-sender wrote. `tests/conformance/test_frame_text.py` holds that reader against
-the suite beside one that skips the decode and one that trusts the standard
-library's strict setting.
+sender wrote. Its strict base64url setting, `validate=True` with base64url's
+`altchars`, still takes padding, the standard alphabet beside base64url's own,
+and set unused bits. `tests/conformance/test_frame_text.py` holds readers of
+both shapes against the suite, beside one that skips the decode, one that
+checks every character and skips the round trip, one that reads a dangling
+character as nothing, and one that answers the frame's refusals as the
+text's.
 
 ## The sequence, and the rule for a sender that restarts
 
@@ -264,11 +268,12 @@ _CHECKED_HEADER = HEADER_SIZE - 4
 #: refuse.
 #:
 #: The claim rides in the BODY, not in the header, and that is the note under
-#: *What is deliberately absent* applied to a second field: a claim in the
-#: header would be a claim the frame cannot verify. In the body it is covered
-#: by the CRC and ordered by the sequence, and that is all the frame says of
-#: it -- that it arrived as it was sent, once. Whether the sender may present
-#: it is still the consumer's to check, against the lease version it names.
+#: *What is deliberately absent* applied to a second field: the header carries
+#: only fields the frame itself checks, and a claim is not one -- a field there
+#: would be a claim the frame cannot verify. As body bytes it is opaque to the
+#: frame like any body, and the CRC and the sequence say of it only what they
+#: say of every frame: that it arrived as it was sent, once. Whether the sender
+#: may present it is the consumer's to judge, against the lease version it names.
 FINGERPRINT = 1
 EXPLORE_QUERY = 2
 EXPLORE_PROFILE = 3

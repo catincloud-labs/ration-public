@@ -38,8 +38,11 @@ from tests.frame_violators import (
     BodyOnlyCrcCodec,
     CounterOnlyCodec,
     CrcBeforeVersionCodec,
+    CollapsesLayersCodec,
+    DropsDanglingTextCodec,
     IgnoresTrailingCodec,
     LenientTextCodec,
+    LibraryStrictTextCodec,
     NonCanonicalTextCodec,
     SequencesBeforeCheckingCodec,
     SkipsTextDecodeCodec,
@@ -58,10 +61,10 @@ __all__ = ["CODECS", "BODY", "CLAIM", "CodecCase", "CodecUnderTest"]
 BODY = b'{"payload":{"layers":{"models":"9f2c"},"models":["a","b"]},"payload_kind":"fingerprint"}'
 
 #: A claim-only body, the shape `role-claim` names, which this suite never
-#: decodes either. Its length is chosen, not incidental: it makes a 41-byte
-#: frame, which is not a multiple of three, so the frame's text ends in a
-#: character with unused bits -- the bits a non-canonical text sets.
-CLAIM = b'{"role_version":315821}'
+#: decodes either. The version is arbitrary; the length is chosen: it makes a
+#: 41-byte frame, which is not a multiple of three, so the frame's text ends in
+#: a character with unused bits -- the bits a non-canonical text sets.
+CLAIM = b'{"role_version":123456}'
 
 
 @dataclass
@@ -94,10 +97,10 @@ class CodecUnderTest:
     def decode(self, data: bytes, sender: str | None = None) -> Frame | FrameRefusal:
         """Decode `data`; with no `sender`, against a ledger that has seen nothing.
 
-        That default is how the properties stay separate. Four of the five
+        That default is how the properties stay separate. All but one
         are not about sequence, and a test for one of them that carried
         sequence state between frames would let a reader that consumes a
-        sequence on refusal -- `sequences-before-checking` -- fail the four
+        sequence on refusal -- `sequences-before-checking` -- fail the
         properties it does not claim, beside the one it does. A violator
         that fails everything proves nothing about
         which check caught it, so each property is decided with the others
@@ -187,8 +190,11 @@ CODECS: list[CodecCase] = [
         SequencesBeforeCheckingCodec,
     ),
     _case("lenient-text", {"frame-text"}, LenientTextCodec),
+    _case("library-strict", {"frame-text"}, LibraryStrictTextCodec),
     _case("skips-text-decode", {"frame-text"}, SkipsTextDecodeCodec),
-    # The standard library's strict settings, as a codec: every character
-    # checked, and a last character's unused bits never looked at.
+    # Every character checked against base64url, and a last character's
+    # unused bits never looked at.
     _case("accepts-non-canonical", {"frame-text"}, NonCanonicalTextCodec),
+    _case("drops-dangling-character", {"frame-text"}, DropsDanglingTextCodec),
+    _case("collapses-layers", {"frame-text"}, CollapsesLayersCodec),
 ]

@@ -94,7 +94,7 @@ def test_the_text_form_is_base64url_without_padding() -> None:
 
 
 def test_a_claim_round_trips_through_its_text() -> None:
-    claim = b'{"role_version":315821}'
+    claim = b'{"role_version":123456}'
     text = encode_text(ROLE_CLAIM, Sequence(42, 9), claim)
     assert text.isascii() and "=" not in text
     decoded = decode_text(text, SequenceLedger())
@@ -109,7 +109,7 @@ def test_a_fault_in_the_bytes_under_the_text_is_refused_by_the_frame() -> None:
     because which frame check refuses it varies with the checks a reader has.
     Here the reader has them all, so the control is pinned too.
     """
-    frame = encode(ROLE_CLAIM, Sequence(7, 0), b'{"role_version":315821}')
+    frame = encode(ROLE_CLAIM, Sequence(7, 0), b'{"role_version":123456}')
     flipped = bytearray(frame)
     flipped[HEADER_SIZE + 5] ^= 1 << 2
     corrupted = base64.urlsafe_b64encode(bytes(flipped)).decode("ascii").rstrip("=")
@@ -235,7 +235,7 @@ def test_decode_text_returns_on_anything_and_never_raises() -> None:
     lone surrogate, which a `str` can hold and no encoding can write.
     """
     rng = random.Random(2026_10_30)
-    healthy = encode_text(ROLE_CLAIM, Sequence(7, 0), b'{"role_version":315821}')
+    healthy = encode_text(ROLE_CLAIM, Sequence(7, 0), b'{"role_version":123456}')
     pool = (
         string.ascii_letters + string.digits + "-_" + "=+/ \t\r\n!." + "\uff21\u00e9\ud800"
     )
