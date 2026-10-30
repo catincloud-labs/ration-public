@@ -220,6 +220,28 @@ frame of a version this reader does not speak refuses as exactly that, before
 anything assumes v1's layout. The layout table and the order are in the module
 docstring, once.
 
+**A frame can also travel as text**, in a request header, for a route that
+takes no HTTP body. The frame inside is an unchanged v1 frame, and its seven
+checks run on its bytes as they would on a body's; only the carrier differs.
+The text form is base64url (RFC 4648, section 5) with no padding, so a frame
+of `n` bytes is `ceil(4n / 3)` characters and the header-only frame is 24. The
+decode is strict, and strict means canonical: a frame has exactly one text,
+the one `encode_text` writes, and any other string is refused as
+`malformed-text`, the ninth control, before any frame check runs. Which header
+carries the text is the consumer's transport choice and is named on its side,
+not here.
+
+The strictness is the property, because the obvious decoders are not strict.
+Python's default `base64.b64decode` drops a character outside its alphabet and
+returns the bytes the text held without it. Its strict base64url setting
+(`validate=True` with base64url's `altchars`) still takes padding and the
+standard alphabet's `+` and `/`. And every setting, `binascii.a2b_base64` with
+`strict_mode=True` included, reads a last character whose unused bits are set
+as the same bytes as the canonical one, so two texts decode to one frame; the
+text property asserts that reading before it relies on it. The reader
+therefore checks every character against base64url, decodes, re-encodes, and
+refuses any text that does not come back as itself.
+
 **The sequence is the check with a live failure mode**, because HTTP frames one
 request and neither orders nor de-duplicates requests from a sender: a retried
 `POST` is a duplicate the transport delivers happily. The rule for a sender
@@ -248,6 +270,12 @@ check**, one per check, each the shape a shortcut takes:
 | An unknown version is refused as that, before its layout is assumed | version ahead of the reader, version ahead with the CRC moved, version zero | `unchecked-version`; `crc-before-version` - every check present, only the order wrong |
 | An unregistered kind is refused | kind unknown to the registry, kind zero | `unchecked-kind` |
 | Exactly the next sequence, or a fresh epoch at zero | duplicated, skipped, behind, restart at a fresh epoch, an older epoch replayed, a new epoch not at zero, retry of a refused frame | `unchecked-sequence`; `counter-only` - 32 bits and no restart rule, so it turns the honest restart away; `sequences-before-checking` - the right rule, applied before the CRC has spoken |
+| Only a frame's canonical text is read, and any other string is refused as text | a character outside the alphabet, whitespace, a character outside ASCII, padding, the standard alphabet's `+` and `/`, a length one past a multiple of four, a second text of the same frame at every unused bit of both length classes; and a well-formed text of bad bytes, refused by the frame rather than the text | `lenient-text` - the standard library's default decode, which drops what it does not recognise; `library-strict` - its strict base64url setting, which still takes padding and both alphabets; `skips-text-decode` - hands the header to the frame reader undecoded; `accepts-non-canonical` - every character checked against base64url and the round trip skipped; `drops-dangling-character` - reads a dangling character as nothing, as Node's `Buffer` does; `collapses-layers` - answers the frame's refusals as the text's |
+
+One hostile case is separated by no registered reader: a character outside
+ASCII, which every reader here refuses as text because the standard library
+raises on it. A reader that normalised the text to NFKC first would fail it;
+none is registered, and `tests/conformance/test_frame_text.py` says why.
 
 Same mechanism as the store suite, not a copy of it: one marker, one strict
 xfail, one set of bookkeeping assertions in
@@ -264,7 +292,7 @@ frame accepted, and a reader that consumes a sequence on refusal breaks the
 retry after *every* refusal, so it failed length, integrity, version and kind
 for a defect that is entirely about the ledger. A violator that fails
 everything proves nothing about which check caught it. The fix is in
-`tests/support/codecs.py`: the four properties that are not about sequence are
+`tests/support/codecs.py`: every property that is not about sequence is
 decided against a ledger that has seen nothing, so a sequence refusal cannot
 masquerade as theirs, and the one property that is about the ledger names its
 sender on every decode. The same run had `unchecked-crc` red on the
@@ -275,17 +303,41 @@ Both are the same lesson the store suite records about `conflict-writes`,
 arriving from the other direction: the property, not the assertion, is the
 unit, and a property test must hold every other property still.
 
+The text property's first run taught it a third time. Its arm for a fault in
+the bytes under a well-formed text asserted `crc-mismatch`, so `unchecked-crc`
+and `body-only-crc` failed a text property for a CRC defect. That arm now
+asserts only that the refusal is a frame control rather than the text's, and
+`tests/test_frame.py` pins the exact control on the reference reader. The
+second run had `body-only-crc` red on the standard-alphabet arm: the frame's
+only `-` had been in the CRC's characters, which that reader writes
+differently, so the arm went vacuous for it and its own guard said so. The
+frame's epoch is now chosen to put a `_` in the sequence field, in bytes every
+reader writes alike.
+
 **Three costs stated rather than hidden.** A ledger that has seen nothing takes
 the first frame as its baseline, so a replay against a fresh receiver is not
 caught; the alternative would turn every receiver restart into a forced restart
 of every sender. The header carries **no sender field**: which sender a frame
 belongs to is the receiver's knowledge, and a sender identity in the header
 would be a claim the frame cannot verify. And the kind registry is **closed and
-short**: four kinds, a consumer's fingerprint envelope by the envelope's own
-name and one per body-carrying route of a consumer's service. Their codes are
-on the wire and their names label them, so they do not change.
+short**: five kinds, a consumer's fingerprint envelope by the envelope's own
+name, one per body-carrying route of a consumer's service, and `role-claim`.
+Their codes are on the wire and their names label them, so they do not change.
 
-A fifth kind lands here before anything sends it. A code nobody sends is inert,
+`role-claim` is a claim-only body, the fencing claim a sender presents and
+nothing beside it: the kind a route with no HTTP body takes, its frame carried
+as text. It is one code for every such route rather than one per route. A code
+means one body shape and this is one shape, and the frame carries a CRC, not a
+MAC, so anyone who can build a frame can build it with any registered kind: a
+code per route would catch only a sender wired to the wrong route. The claim
+rides in the body for the same reason the header carries no sender: the
+header carries only fields the frame itself checks, and a claim there would be
+one the frame cannot verify. As body bytes it is opaque to the frame like any
+body, and the CRC and the sequence say of it only what they say of every
+frame, that it arrived as sent, once; whether the sender may present it is the
+consumer's to judge.
+
+A sixth kind lands here before anything sends it. A code nobody sends is inert,
 while a decoder selecting on a code this registry does not name has every
 framed request refused as `unknown-payload-kind`; so the row comes first, and a
 consumer that installs this package at a commit sees it when it moves to that

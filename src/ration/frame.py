@@ -82,6 +82,45 @@ A later frame version leans on it:
 
 Only then is the frame handed back, and only then does the ledger move.
 
+## The text form, for a frame that travels in a request header
+
+A route that takes no HTTP body can still carry a frame, in a request header.
+A header value is text, so the frame's bytes travel under one text form, and
+that form is this module's: the frame inside it is an unchanged v1 frame, and
+the seven checks above run on its bytes exactly as they run on a body's. Which
+header carries it is the consumer's transport choice, declared on its side,
+and this module does not name one.
+
+- **The alphabet is base64url** (RFC 4648, section 5): `A-Z`, `a-z`, `0-9`,
+  `-` and `_`. Every one is a valid character in an HTTP field value, in a URL
+  and in a cookie, so the text needs no further escaping on any of them.
+- **There is no padding.** The text's length already says how many bytes it
+  holds, so `=` is never written and never read: a text that carries it is
+  refused. A frame of `n` bytes is `ceil(4n / 3)` characters; the
+  header-only frame is 24.
+- **The decode is strict, and strict means canonical.** A frame has exactly one
+  text, the one :meth:`FrameCodec.encode_text` writes, and every other string
+  is refused -- a character outside the alphabet, whitespace, padding, a
+  length that holds no whole byte, and a last character whose unused bits are
+  not zero. The last is why the check is a round trip rather than a character
+  scan: the standard library's own strict settings read such a text as the
+  same bytes as the canonical one, so two texts would decode to one frame.
+- **Its refusal is `malformed-text`,** and it comes before every frame check,
+  since until the text is read there are no frame bytes to check. A fault in
+  the text is refused as the text's; a fault in the bytes the text carries is
+  refused by the check that owns it, so a log record says which layer failed.
+
+The leniency is not hypothetical. Python's default `base64.b64decode` drops a
+character outside its alphabet silently and returns the bytes the text held
+before the character was added, so a reader built on it accepts a text no
+sender wrote. Its strict base64url setting, `validate=True` with base64url's
+`altchars`, still takes padding, the standard alphabet beside base64url's own,
+and set unused bits. `tests/conformance/test_frame_text.py` holds readers of
+both shapes against the suite, beside one that skips the decode, one that
+checks every character and skips the round trip, one that reads a dangling
+character as nothing, and one that answers the frame's refusals as the
+text's.
+
 ## The sequence, and the rule for a sender that restarts
 
 This is the one frame check with a live failure mode under HTTP -- a retried
@@ -132,14 +171,16 @@ own restarts is the consumer's decision, not this module's.
 - **Any opinion about the body.** The reader returns the body's bytes and
   the kind that says what they decode as. What decodes them is the
   consumer's, exactly as `addressing.py` refuses to parse an endpoint.
-- **Decode raising.** Bytes off a network are data, not programmer error.
-  Every way they can be wrong is a :class:`FrameRefusal` with a control from
-  the closed set below. Encode is the other posture: a sender's own arguments
-  are its own data, and a wrong one raises.
+- **Decode raising.** Bytes off a network are data, not programmer error,
+  and so is a header's text. Every way they can be wrong is a
+  :class:`FrameRefusal` with a control from the closed set below. Encode is
+  the other posture: a sender's own arguments are its own data, and a wrong
+  one raises.
 """
 
 from __future__ import annotations
 
+import base64
 import struct
 import zlib
 from dataclasses import dataclass
@@ -158,6 +199,8 @@ __all__ = [
     "FrameRefusal",
     "HEADER_SIZE",
     "KINDS",
+    "MALFORMED_TEXT",
+    "ROLE_CLAIM",
     "SEQUENCE_DUPLICATE",
     "SEQUENCE_GAP",
     "SEQUENCE_REPLAYED",
@@ -168,7 +211,9 @@ __all__ = [
     "UNKNOWN_FRAME_VERSION",
     "UNKNOWN_PAYLOAD_KIND",
     "decode",
+    "decode_text",
     "encode",
+    "encode_text",
 ]
 
 #: Bump ONLY when the header's own shape changes, and in the same commit as the
@@ -210,16 +255,37 @@ _CHECKED_HEADER = HEADER_SIZE - 4
 #: The three `explore-*` codes are one code per body-carrying route of a
 #: consumer's service, rather than one code for all three: the routes' bodies
 #: have different shapes, and a code means one body shape.
+#:
+#: `role-claim` is a claim-only body: the fencing claim a sender presents for
+#: a role it holds, and nothing beside it. It is the kind a route with no HTTP
+#: body takes, its frame carried in the text form above. It is ONE code for
+#: every route that takes a claim alone, not one per route: a code means one
+#: body shape, and this is one shape. A code per route would buy nothing the
+#: frame can stand behind, because the frame carries a CRC, not a MAC -- anyone
+#: who can build a frame can build it with any registered kind, so a per-route
+#: code would catch only a sender wired to the wrong route, and that is a
+#: mistake for the consumer's own sender checks, not an attack the registry can
+#: refuse.
+#:
+#: The claim rides in the BODY, not in the header, and that is the note under
+#: *What is deliberately absent* applied to a second field: the header carries
+#: only fields the frame itself checks, and a claim is not one -- a field there
+#: would be a claim the frame cannot verify. As body bytes it is opaque to the
+#: frame like any body, and the CRC and the sequence say of it only what they
+#: say of every frame: that it arrived as it was sent, once. Whether the sender
+#: may present it is the consumer's to judge, against the lease version it names.
 FINGERPRINT = 1
 EXPLORE_QUERY = 2
 EXPLORE_PROFILE = 3
 EXPLORE_CLUSTER = 4
+ROLE_CLAIM = 5
 KINDS = MappingProxyType(
     {
         FINGERPRINT: "fingerprint",
         EXPLORE_QUERY: "explore-query",
         EXPLORE_PROFILE: "explore-profile",
         EXPLORE_CLUSTER: "explore-cluster",
+        ROLE_CLAIM: "role-claim",
     }
 )
 
@@ -245,9 +311,13 @@ UNKNOWN_PAYLOAD_KIND = "unknown-payload-kind"
 SEQUENCE_DUPLICATE = "sequence-duplicate"
 SEQUENCE_REPLAYED = "sequence-replayed"
 SEQUENCE_GAP = "sequence-gap"
+# The ninth, and the only one about text rather than bytes: a string that is
+# not the canonical text form of any frame. See the module docstring.
+MALFORMED_TEXT = "malformed-text"
 
 CONTROLS = frozenset(
     {
+        MALFORMED_TEXT,
         TRUNCATED,
         UNKNOWN_FRAME_VERSION,
         CRC_MISMATCH,
@@ -260,6 +330,11 @@ CONTROLS = frozenset(
 )
 
 _WORD = 1 << 32
+
+#: The text form's alphabet: base64url, RFC 4648 section 5, with no `=`.
+_TEXT_ALPHABET = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+)
 
 
 @dataclass(frozen=True)
@@ -406,6 +481,69 @@ class FrameCodec:
         ]
         return checked + struct.pack("!I", self.checksum(checked, body)) + body
 
+    def encode_text(self, kind: int, sequence: Sequence, body: bytes) -> str:
+        """The frame's text form, for a request header. Raises as :meth:`encode` does."""
+        return self.to_text(self.encode(kind, sequence, body))
+
+    def to_text(self, data: bytes) -> str:
+        """Bytes as the text form: base64url, with no padding."""
+        return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+    # -- reading text, before any frame check --------------------------------
+
+    def decode_text(self, text: str, ledger: SequenceLedger) -> Frame | FrameRefusal:
+        """A header's text to a checked frame, or a typed refusal.
+
+        The text is read first and strictly, and only the bytes it holds reach
+        :meth:`decode`, whose checks then run unchanged. What a header carries
+        is data and never raises; a ``text`` that is not a ``str`` at all is
+        the caller's own mistake, and does.
+        """
+        if not isinstance(text, str):
+            raise TypeError(f"text must be a str, not {type(text).__name__}")
+        data = self.from_text(text)
+        if isinstance(data, FrameRefusal):
+            return data
+        return self.decode(data, ledger)
+
+    def from_text(self, text: str) -> bytes | FrameRefusal:
+        """The bytes the text form holds, or `malformed-text` for any other string."""
+        refused = self.text_well_formed(text)
+        if refused is not None:
+            return refused
+        # Every character is in the alphabet and the length holds whole bytes,
+        # so the padding restored here is exact and nothing is dropped.
+        data = base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+        refused = self.text_canonical(text, data)
+        if refused is not None:
+            return refused
+        return data
+
+    def text_well_formed(self, text: str) -> FrameRefusal | None:
+        for position, character in enumerate(text):
+            if character not in _TEXT_ALPHABET:
+                return FrameRefusal(
+                    MALFORMED_TEXT,
+                    f"character {ascii(character)} at position {position} is "
+                    "outside the text form's alphabet, base64url without padding",
+                )
+        if len(text) % 4 == 1:
+            return FrameRefusal(
+                MALFORMED_TEXT,
+                f"{len(text)} characters hold no whole number of bytes: a "
+                "base64url text is never one more than a multiple of four long",
+            )
+        return None
+
+    def text_canonical(self, text: str, data: bytes) -> FrameRefusal | None:
+        if self.to_text(data) != text:
+            return FrameRefusal(
+                MALFORMED_TEXT,
+                "the last character carries bits the text form leaves zero, so "
+                "this is not the one text of the bytes it holds",
+            )
+        return None
+
     # -- reading, in the stated order ----------------------------------------
 
     def decode(self, data: bytes, ledger: SequenceLedger) -> Frame | FrameRefusal:
@@ -515,3 +653,13 @@ def encode(kind: int, sequence: Sequence, body: bytes) -> bytes:
 def decode(data: bytes, ledger: SequenceLedger) -> Frame | FrameRefusal:
     """Bytes to a checked frame, or a typed refusal. See :meth:`FrameCodec.decode`."""
     return _V1.decode(data, ledger)
+
+
+def encode_text(kind: int, sequence: Sequence, body: bytes) -> str:
+    """A v1 frame around `body`, in its text form. See :meth:`FrameCodec.encode_text`."""
+    return _V1.encode_text(kind, sequence, body)
+
+
+def decode_text(text: str, ledger: SequenceLedger) -> Frame | FrameRefusal:
+    """A header's text to a checked frame, or a typed refusal. See :meth:`FrameCodec.decode_text`."""
+    return _V1.decode_text(text, ledger)
